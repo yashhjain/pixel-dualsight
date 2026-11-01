@@ -40,7 +40,7 @@ jobs:
 
           cat << 'EOF' > build.gradle.kts
           plugins {
-              id("com.android.application") version "8.5.2" apply false
+              id("com.android.application") version "8.7.3" apply false
               id("org.jetbrains.kotlin.android") version "1.9.24" apply false
           }
           EOF
@@ -59,7 +59,7 @@ jobs:
           }
           android {
               namespace = "com.pixel11.dualsight"
-              compileSdk = 34
+              compileSdk = 35
               defaultConfig {
                   applicationId = "com.pixel11.dualsight"
                   minSdk = 30
@@ -225,6 +225,8 @@ jobs:
               private var cachedExtensions: ExtensionsManager? = null
               private var rearCamera: Camera? = null
               private var frontCamera: Camera? = null
+              private var rearPreviewUseCase: Preview? = null
+              private var frontPreviewUseCase: Preview? = null
               private var isBindingCameras = false
               private var isCapturingPhoto = false
 
@@ -747,7 +749,7 @@ jobs:
                                   setDataAndType(uri, "image/jpeg")
                                   addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                               }
-                              try { startActivity(intent) } catch (_: Exception) {}
+                              try { startActivity(intent) } catch (ignored: Exception) {}
                           } ?: Toast.makeText(this@MainActivity, "Tap the center shutter to capture a Dual Sight photo!", Toast.LENGTH_SHORT).show()
                       }
                   }
@@ -1098,7 +1100,7 @@ jobs:
                               shutterSound.play(MediaActionSound.FOCUS_COMPLETE)
                           }, ContextCompat.getMainExecutor(this))
                       }
-                  } catch (_: Exception) {
+                  } catch (ignored: Exception) {
                   }
               }
 
@@ -1195,8 +1197,8 @@ jobs:
               }
 
               private fun updateLiveResolutionBadge() {
-                  val rRes = previewRear.resolutionInfo?.resolution
-                  val fRes = previewFront.resolutionInfo?.resolution
+                  val rRes = rearPreviewUseCase?.resolutionInfo?.resolution
+                  val fRes = if (frontCamera != null) frontPreviewUseCase?.resolutionInfo?.resolution else null
                   val rText = if (rRes != null) "R:${rRes.width}×${rRes.height}" else "R:50MP"
                   val fText = if (fRes != null) "F:${fRes.width}×${fRes.height}" else "F:42MP"
                   val modePrefix = if (proMaxResMode) "4K MAX • " else ""
@@ -1288,7 +1290,7 @@ jobs:
               }
 
               // Build high-resolution Preview streams using CameraX ResolutionSelector (unlocks QHD+/4K on both Rear & Front!)
-              private fun buildHighResPreview(surfaceProvider: Preview.SurfaceProvider, preferBurstMax: Boolean): Preview {
+              private fun buildHighResPreview(surfaceProvider: Preview.SurfaceProvider, preferBurstMax: Boolean, isFront: Boolean): Preview {
                   val resBuilder = ResolutionSelector.Builder()
                       .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
                       .setResolutionStrategy(
@@ -1300,10 +1302,12 @@ jobs:
                   if (preferBurstMax) {
                       resBuilder.setAllowedResolutionMode(ResolutionSelector.PREFER_HIGHER_RESOLUTION_OVER_CAPTURE_RATE)
                   }
-                  return Preview.Builder()
+                  val preview = Preview.Builder()
                       .setResolutionSelector(resBuilder.build())
                       .build()
-                      .also { it.setSurfaceProvider(surfaceProvider) }
+                  preview.setSurfaceProvider(surfaceProvider)
+                  if (isFront) frontPreviewUseCase = preview else rearPreviewUseCase = preview
+                  return preview
               }
 
               private fun initializeCameraProvider() {
@@ -1314,7 +1318,7 @@ jobs:
                       discoverPixelTripleCameras(provider)
                       val extFuture = ExtensionsManager.getInstanceAsync(this, provider)
                       extFuture.addListener({
-                          try { cachedExtensions = extFuture.get() } catch (_: Exception) {}
+                          try { cachedExtensions = extFuture.get() } catch (ignored: Exception) {}
                           bindDualCamerasSafely()
                       }, ContextCompat.getMainExecutor(this))
                   }, ContextCompat.getMainExecutor(this))
@@ -1338,7 +1342,7 @@ jobs:
                       // If user enabled "4K+ Max-Res ISP Mode", bind single active sensor with uncapped 4K/HDR Extensions
                       // so Android's concurrent HAL never throttles preview resolution!
                       if (proMaxResMode) {
-                          val pRearMax = buildHighResPreview(previewRear.surfaceProvider, preferBurstMax = true)
+                          val pRearMax = buildHighResPreview(previewRear.surfaceProvider, preferBurstMax = true, isFront = false)
                           val extMgr = cachedExtensions
                           val selectorWithHdr = if (extMgr != null && extMgr.isExtensionAvailable(targetRearSelector, ExtensionMode.HDR)) {
                               extMgr.getExtensionEnabledCameraSelector(targetRearSelector, ExtensionMode.HDR)
@@ -1378,8 +1382,8 @@ jobs:
                           for (allowHigherMode in listOf(true, false)) {
                               if (boundSuccess) break
                               try {
-                                  val pRearHi = buildHighResPreview(previewRear.surfaceProvider, preferBurstMax = allowHigherMode)
-                                  val pFrontHi = buildHighResPreview(previewFront.surfaceProvider, preferBurstMax = allowHigherMode)
+                                  val pRearHi = buildHighResPreview(previewRear.surfaceProvider, preferBurstMax = allowHigherMode, isFront = false)
+                                  val pFrontHi = buildHighResPreview(previewFront.surfaceProvider, preferBurstMax = allowHigherMode, isFront = true)
 
                                   val primaryConfig = SingleCameraConfig(
                                       targetRearSelector,
@@ -1399,7 +1403,7 @@ jobs:
                                       it.cameraInfo.lensFacing == CameraSelector.LENS_FACING_FRONT
                                   }
                                   boundSuccess = true
-                              } catch (_: Exception) {
+                              } catch (ignored: Exception) {
                                   boundSuccess = false
                               }
                           }
@@ -1408,8 +1412,8 @@ jobs:
                       // Tier 2: Try default concurrent camera pair with High-Res ResolutionSelector on both Rear & Front
                       if (!boundSuccess && concurrentBack != null && concurrentFront != null) {
                           try {
-                              val pRearHi = buildHighResPreview(previewRear.surfaceProvider, preferBurstMax = false)
-                              val pFrontHi = buildHighResPreview(previewFront.surfaceProvider, preferBurstMax = false)
+                              val pRearHi = buildHighResPreview(previewRear.surfaceProvider, preferBurstMax = false, isFront = false)
+                              val pFrontHi = buildHighResPreview(previewFront.surfaceProvider, preferBurstMax = false, isFront = true)
                               val primaryConfig = SingleCameraConfig(
                                   concurrentBack,
                                   UseCaseGroup.Builder().addUseCase(pRearHi).build(),
@@ -1428,14 +1432,14 @@ jobs:
                                   it.cameraInfo.lensFacing == CameraSelector.LENS_FACING_FRONT
                               }
                               boundSuccess = true
-                          } catch (_: Exception) {
+                          } catch (ignored: Exception) {
                               boundSuccess = false
                           }
                       }
 
                       // Tier 3: Fallback to single high-res rear camera
                       if (!boundSuccess) {
-                          val pRearMax = buildHighResPreview(previewRear.surfaceProvider, preferBurstMax = true)
+                          val pRearMax = buildHighResPreview(previewRear.surfaceProvider, preferBurstMax = true, isFront = false)
                           rearCamera = cameraProvider.bindToLifecycle(this, targetRearSelector, pRearMax)
                       }
 
@@ -1446,7 +1450,7 @@ jobs:
                               triggerTapToFocus(stageCard.width / 2f, stageCard.height / 2f, focusFront = false)
                           }
                       }, 200)
-                  } catch (_: Exception) {
+                  } catch (ignored: Exception) {
                   } finally {
                       isBindingCameras = false
                   }
@@ -1498,7 +1502,7 @@ jobs:
                       heldRearMaxResBmp = previewRear.bitmap
                       try {
                           provider.unbindAll()
-                          val pFrontMax = buildHighResPreview(previewFront.surfaceProvider, preferBurstMax = true)
+                          val pFrontMax = buildHighResPreview(previewFront.surfaceProvider, preferBurstMax = true, isFront = true)
                           frontCamera = provider.bindToLifecycle(this, defaultFrontSelector, pFrontMax)
                           mainHandler.postDelayed({
                               heldFrontMaxResBmp = previewFront.bitmap
@@ -1506,7 +1510,7 @@ jobs:
                               bindDualCamerasSafely()
                           }, 420)
                           return
-                      } catch (_: Exception) {
+                      } catch (ignored: Exception) {
                       }
                   }
 
@@ -1619,12 +1623,12 @@ jobs:
                                       ).show()
                                   }
                               }
-                          } catch (_: Exception) {
+                          } catch (ignored: Exception) {
                           } finally {
                               mainHandler.post { isCapturingPhoto = false }
                           }
                       }
-                  } catch (_: Exception) {
+                  } catch (ignored: Exception) {
                       isCapturingPhoto = false
                   }
               }
@@ -1661,14 +1665,14 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Gradle 8.7
-        uses: gradle/actions/setup-gradle@v3
+      - name: Setup Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.7'
+          gradle-version: '8.9'
 
       - name: Compile Android APK
         run: |
-          gradle assembleDebug
+          gradle assembleDebug --stacktrace
           cp app/build/outputs/apk/debug/app-debug.apk Pixel11-DualSight.apk
 
       - name: Upload APK Artifact
