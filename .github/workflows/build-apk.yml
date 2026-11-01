@@ -64,8 +64,8 @@ jobs:
                   applicationId = "com.pixel11.dualsight"
                   minSdk = 30
                   targetSdk = 34
-                  versionCode = 2
-                  versionName = "2.0.0"
+                  versionCode = 3
+                  versionName = "3.0.0"
               }
               buildTypes {
                   release {
@@ -142,11 +142,6 @@ jobs:
           import android.graphics.RenderEffect
           import android.graphics.Typeface
           import android.graphics.drawable.GradientDrawable
-          import android.hardware.camera2.CameraCaptureSession
-          import android.hardware.camera2.CameraCharacteristics
-          import android.hardware.camera2.CaptureRequest
-          import android.hardware.camera2.CaptureResult
-          import android.hardware.camera2.TotalCaptureResult
           import android.media.MediaActionSound
           import android.net.Uri
           import android.os.Build
@@ -171,12 +166,7 @@ jobs:
           import android.widget.Toast
           import androidx.activity.result.contract.ActivityResultContracts
           import androidx.appcompat.app.AppCompatActivity
-          import androidx.camera.camera2.interop.Camera2CameraInfo
-          import androidx.camera.camera2.interop.Camera2Interop
-          import androidx.camera.camera2.interop.ExperimentalCamera2Interop
           import androidx.camera.core.Camera
-          import androidx.camera.core.CameraFilter
-          import androidx.camera.core.CameraInfo
           import androidx.camera.core.CameraSelector
           import androidx.camera.core.ConcurrentCamera.SingleCameraConfig
           import androidx.camera.core.FocusMeteringAction
@@ -190,7 +180,6 @@ jobs:
           import kotlin.math.abs
           import kotlin.math.min
 
-          @OptIn(ExperimentalCamera2Interop::class)
           class MainActivity : AppCompatActivity() {
 
               private lateinit var stageCard: FrameLayout
@@ -200,7 +189,6 @@ jobs:
               private lateinit var previewFront: PreviewView
               private lateinit var gridOverlayView: GridOverlayView
               private lateinit var focusRingView: FrameLayout
-              private lateinit var passiveAfBracket: FrameLayout
               private lateinit var flashOverlay: View
               private lateinit var countdownLabel: TextView
               private lateinit var thumbView: ImageView
@@ -214,7 +202,6 @@ jobs:
               private lateinit var btnTimerChip: TextView
               private lateinit var btnGridChip: TextView
 
-              // Both floating and fixed deck zoom buttons so zoom selection is ALWAYS visible on screen
               private val deckZoomButtons = mutableMapOf<Float, TextView>()
               private val lensRoleChips = mutableMapOf<String, TextView>()
               private val layoutChips = mutableListOf<TextView>()
@@ -226,16 +213,15 @@ jobs:
               private var isBindingCameras = false
               private var isCapturingPhoto = false
 
-              // Discovered Pixel 11 Pro XL Triple Rear Camera Selectors
+              // Pixel 11 Pro XL Triple Rear Camera Selectors discovered via stable CameraInfo.intrinsicZoomRatio
               private var logicalBackSelector: CameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
-              private var ultraWideCameraId: String? = null
-              private var mainWideCameraId: String? = null
-              private var telephotoCameraId: String? = null
+              private var ultraWideSelector: CameraSelector? = null
+              private var mainWideSelector: CameraSelector? = null
+              private var telephotoSelector: CameraSelector? = null
               private var selectedLensRole: String = "AUTO" // "AUTO", "UW", "WIDE", "TELE"
 
               private var currentZoom = 1.0f
               private var lastZoomApplyMs = 0L
-              private var lastReportedAfState = -1
               private var swapSlots = false
               private var torchEnabled = false
               private var gridEnabled = false
@@ -247,7 +233,7 @@ jobs:
               private val mainHandler = Handler(Looper.getMainLooper())
               private val ioExecutor = Executors.newSingleThreadExecutor()
 
-              // 0 = PiP Card, 1 = Circle Bubble, 2 = 70/30 Split, 3 = 50/50 Split, 4 = Side-by-Side
+              // 0 = PiP Card, 1 = Circle Bubble, 2 = 70/30 Split, 3 = 50/50 Split, 4 = Left/Right
               private var layoutMode = 0
               private val layoutLabels = listOf("PiP Card", "Circle", "70/30 Split", "50/50 Split", "Left/Right")
               private var pipScale = 1.0f
@@ -303,7 +289,7 @@ jobs:
                       setPadding(dp(8), dp(6), dp(8), dp(8))
                   }
 
-                  // 1. TOP UTILITY BAR (Torch, Timer, Grid, PiP Size, AF Trigger)
+                  // 1. TOP UTILITY BAR (Torch, Timer, Grid, PiP Size)
                   val topHud = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
                       gravity = Gravity.CENTER_VERTICAL
@@ -367,7 +353,7 @@ jobs:
                       bottomMargin = dp(6)
                   })
 
-                  // 2. VIEWFINDER STAGE (Rounded 24dp with strict elevation ordering so HUD & AF rings are always visible)
+                  // 2. VIEWFINDER STAGE (Rounded 24dp with strict elevation ordering)
                   stageCard = FrameLayout(this).apply {
                       background = pillDrawable("#000000", 24, "#29FFFFFF", 1)
                       clipChildren = true
@@ -406,22 +392,14 @@ jobs:
                   stageCard.addView(rearContainer)
                   stageCard.addView(frontContainer)
 
-                  // 3x3 Rule-of-Thirds Grid Overlay (elevation = 12dp so it stays above both cameras)
+                  // 3x3 Rule-of-Thirds Grid Overlay (elevation = 12dp)
                   gridOverlayView = GridOverlayView(this).apply {
                       visibility = View.GONE
                       elevation = dp(12).toFloat()
                   }
                   stageCard.addView(gridOverlayView, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
 
-                  // Continuous Passive Autofocus Center Bracket (elevation = 18dp)
-                  passiveAfBracket = FrameLayout(this).apply {
-                      background = pillDrawable("#00000000", 12, "#80FFFFFF", 1)
-                      alpha = 0f
-                      elevation = dp(18).toFloat()
-                  }
-                  stageCard.addView(passiveAfBracket, FrameLayout.LayoutParams(dp(76), dp(76), Gravity.CENTER))
-
-                  // Tap-to-Focus Active Gold Reticle (elevation = 22dp so it is ALWAYS visible above PreviewView)
+                  // Tap-to-Focus Active Gold Reticle (elevation = 22dp so it is always visible above PreviewView)
                   focusRingView = FrameLayout(this).apply {
                       background = circleDrawable("#22FACC15", "#FACC15", 2)
                       alpha = 0f
@@ -451,14 +429,13 @@ jobs:
                   }
 
                   afStatusBadge = TextView(this).apply {
-                      text = "AF-C READY"
+                      text = "● AF-C ACTIVE"
                       setTextColor(Color.parseColor("#93C5FD"))
                       textSize = 10.5f
                       typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
                       background = pillDrawable("#B3090A0F", 12, "#3393C5FD", 1)
                       setPadding(dp(8), dp(4), dp(8), dp(4))
                       setOnClickListener {
-                          // Tap badge to trigger immediate center autofocus lock
                           triggerTapToFocus(stageCard.width / 2f, stageCard.height / 2f)
                       }
                   }
@@ -509,7 +486,7 @@ jobs:
                       setPadding(dp(10), dp(8), dp(10), dp(10))
                   }
 
-                  // ROW 1: DEDICATED ZOOM SELECTION BAR (0.5x | 1x | 2x | 5x | 10x) + TRIPLE CAMERA SENSOR SELECTOR
+                  // ROW 1: DEDICATED ZOOM SELECTION BAR (0.5x | 1x | 2x | 5x | 10x)
                   val zoomRow = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
                       gravity = Gravity.CENTER_VERTICAL
@@ -550,7 +527,7 @@ jobs:
                       bottomMargin = dp(6)
                   })
 
-                  // ROW 2: SMOOTH CONTINUOUS ZOOM SLIDER + PIXEL TRIPLE LENS HARDWARE PICKER (UW / WIDE / TELE / AF LOCK)
+                  // ROW 2: PIXEL TRIPLE LENS HARDWARE PICKER (Auto 3-Lens | 0.5x UW Lens | 1x Main Lens | 5x Tele Lens)
                   val lensAndSliderRow = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
                       gravity = Gravity.CENTER_VERTICAL
@@ -568,7 +545,7 @@ jobs:
                           text = roleTitle
                           textSize = 10.5f
                           gravity = Gravity.CENTER
-                          setPadding(dp(8), dp(4), dp(8), dp(4))
+                          setPadding(dp(6), dp(4), dp(6), dp(4))
                           setOnClickListener {
                               it.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
                               switchPhysicalRearLens(roleKey)
@@ -588,8 +565,8 @@ jobs:
 
                   // Fine Continuous Zoom SeekBar (0.5x .. 10.0x)
                   zoomSeekBar = SeekBar(this).apply {
-                      max = 95 // maps 0..95 -> 0.5x..10.0x
-                      progress = 5 // 1.0x
+                      max = 95
+                      progress = 5
                       setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                           override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
                               if (fromUser) {
@@ -909,7 +886,6 @@ jobs:
                   val scaleDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
                       override fun onScale(detector: ScaleGestureDetector): Boolean {
                           val nextZoom = (currentZoom * detector.scaleFactor).coerceIn(0.5f, 10.0f)
-                          // Throttle hardware zoom calls during pinch to prevent Camera2 queue congestion/freezes
                           val now = SystemClock.uptimeMillis()
                           if (now - lastZoomApplyMs >= 28L) {
                               lastZoomApplyMs = now
@@ -989,9 +965,10 @@ jobs:
               private fun triggerTapToFocus(stageX: Float, stageY: Float) {
                   stageCard.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
 
-                  // Show visible active gold focus reticle right at tap coordinates
-                  focusRingView.x = (stageX - focusRingView.width / 2f).coerceIn(dp(8).toFloat(), (stageCard.width - focusRingView.width - dp(8)).coerceAtLeast(dp(8)).toFloat())
-                  focusRingView.y = (stageY - focusRingView.height / 2f).coerceIn(dp(8).toFloat(), (stageCard.height - focusRingView.height - dp(8)).coerceAtLeast(dp(8)).toFloat())
+                  val maxRingX = (stageCard.width - focusRingView.width - dp(8)).coerceAtLeast(dp(8)).toFloat()
+                  val maxRingY = (stageCard.height - focusRingView.height - dp(8)).coerceAtLeast(dp(8)).toFloat()
+                  focusRingView.x = (stageX - focusRingView.width / 2f).coerceIn(dp(8).toFloat(), maxRingX)
+                  focusRingView.y = (stageY - focusRingView.height / 2f).coerceIn(dp(8).toFloat(), maxRingY)
                   focusRingView.scaleX = 1.45f
                   focusRingView.scaleY = 1.45f
                   focusRingView.alpha = 1f
@@ -1000,14 +977,13 @@ jobs:
                       .scaleY(1f)
                       .setDuration(150)
                       .withEndAction {
-                          focusRingView.animate().alpha(0f).setStartDelay(900).setDuration(240).start()
+                          focusRingView.animate().alpha(0f).setStartDelay(950).setDuration(240).start()
                       }
                       .start()
 
                   afStatusBadge.text = "◎ AF SCANNING..."
                   afStatusBadge.setTextColor(Color.parseColor("#FDE047"))
 
-                  // Convert stage coordinates to previewRear local coordinates
                   val localRearX = (stageX - rearContainer.x).coerceIn(0f, previewRear.width.toFloat().coerceAtLeast(1f))
                   val localRearY = (stageY - rearContainer.y).coerceIn(0f, previewRear.height.toFloat().coerceAtLeast(1f))
 
@@ -1023,6 +999,7 @@ jobs:
                           try {
                               val res = future.get()
                               if (res != null && res.isFocusSuccessful) {
+                                  shutterSound.play(MediaActionSound.FOCUS_COMPLETE)
                                   afStatusBadge.text = "● AF LOCKED ✓"
                                   afStatusBadge.setTextColor(Color.parseColor("#34D399"))
                               } else {
@@ -1038,58 +1015,33 @@ jobs:
                   }
               }
 
-              // Discover all physical & logical rear cameras on Pixel 11 Pro XL (Ultra-Wide, Wide, 5x Telephoto)
+              // Discover Pixel 11 Pro XL Triple Rear Cameras using stable CameraInfo.intrinsicZoomRatio
               private fun discoverPixelTripleCameras(provider: ProcessCameraProvider) {
                   val backInfos = provider.availableCameraInfos.filter {
                       it.lensFacing == CameraSelector.LENS_FACING_BACK
                   }
                   if (backInfos.isEmpty()) return
 
-                  var minFocal = Float.MAX_VALUE
-                  var maxFocal = Float.MIN_VALUE
-                  var uwId: String? = null
-                  var teleId: String? = null
-                  var wideId: String? = null
+                  var minRatio = Float.MAX_VALUE
+                  var maxRatio = Float.MIN_VALUE
 
                   for (info in backInfos) {
-                      val c2 = Camera2CameraInfo.from(info)
-                      val camId = c2.cameraId
-                      val focals = c2.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
-                      val focal = focals?.firstOrNull() ?: 4.5f
-                      val zoomRange = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                          c2.getCameraCharacteristic(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
-                      } else null
-
-                      // If this camera exposes a wide zoom ratio starting < 0.7f, it is the logical multi-camera
-                      if (zoomRange != null && zoomRange.lower < 0.75f && wideId == null) {
-                          wideId = camId
+                      val ratio = info.intrinsicZoomRatio
+                      if (ratio < minRatio) {
+                          minRatio = ratio
+                          ultraWideSelector = info.cameraSelector
                       }
-                      if (focal < minFocal) {
-                          minFocal = focal
-                          uwId = camId
+                      if (ratio > maxRatio) {
+                          maxRatio = ratio
+                          telephotoSelector = info.cameraSelector
                       }
-                      if (focal > maxFocal) {
-                          maxFocal = focal
-                          teleId = camId
+                      if (abs(ratio - 1.0f) < 0.2f && mainWideSelector == null) {
+                          mainWideSelector = info.cameraSelector
                       }
                   }
-
-                  ultraWideCameraId = uwId
-                  telephotoCameraId = teleId
-                  mainWideCameraId = wideId ?: backInfos.first().let { Camera2CameraInfo.from(it).cameraId }
-              }
-
-              private fun buildCameraSelectorForId(targetCameraId: String?): CameraSelector {
-                  if (targetCameraId == null) return CameraSelector.DEFAULT_BACK_CAMERA
-                  return CameraSelector.Builder()
-                      .setLensFacing(CameraSelector.LENS_FACING_BACK)
-                      .addCameraFilter(CameraFilter { cameraInfos ->
-                          val matched = cameraInfos.filter {
-                              Camera2CameraInfo.from(it).cameraId == targetCameraId
-                          }
-                          if (matched.isNotEmpty()) matched else cameraInfos
-                      })
-                      .build()
+                  if (mainWideSelector == null) {
+                      mainWideSelector = backInfos.first().cameraSelector
+                  }
               }
 
               private fun switchPhysicalRearLens(roleKey: String) {
@@ -1104,7 +1056,6 @@ jobs:
                   bindDualCamerasSafely()
               }
 
-              // Smooth, freeze-free zoom control (never calls unbindAll inside pinch/preset zoom!)
               private fun setZoomSmooth(targetZoom: Float, fromPresetButton: Boolean) {
                   val clamped = targetZoom.coerceIn(0.5f, 10.0f)
                   currentZoom = clamped
@@ -1123,18 +1074,16 @@ jobs:
                       val maxZ = zoomState?.maxZoomRatio ?: 8.0f
 
                       if (clamped >= minZ && clamped <= maxZ) {
-                          // Native hardware optical/logical zoom across Pixel's triple-camera array!
                           cam.cameraControl.setZoomRatio(clamped)
                           previewRear.scaleX = 1.0f
                           previewRear.scaleY = 1.0f
                           return
-                      } else if (fromPresetButton && clamped < minZ && ultraWideCameraId != null && selectedLensRole != "UW") {
-                          // Hardware concurrent session locked minZoomRatio to 1.0f; switch to Ultra-Wide sensor if user tapped 0.5x!
+                      } else if (fromPresetButton && clamped < minZ && ultraWideSelector != null && selectedLensRole != "UW") {
                           selectedLensRole = "UW"
                           updateLensRoleChipsUI()
                           bindDualCamerasSafely()
                           return
-                      } else if (fromPresetButton && clamped >= 5.0f && maxZ < 5.0f && telephotoCameraId != null && selectedLensRole != "TELE") {
+                      } else if (fromPresetButton && clamped >= 5.0f && maxZ < 5.0f && telephotoSelector != null && selectedLensRole != "TELE") {
                           selectedLensRole = "TELE"
                           updateLensRoleChipsUI()
                           bindDualCamerasSafely()
@@ -1181,7 +1130,6 @@ jobs:
                   val primaryContainer = if (swapSlots) frontContainer else rearContainer
                   val secondaryContainer = if (swapSlots) rearContainer else frontContainer
 
-                  // Strict elevation hierarchy: Primary = 0dp, Secondary = 4dp, Overlays = 12dp..30dp
                   primaryContainer.elevation = 0f
                   secondaryContainer.elevation = dp(4).toFloat()
 
@@ -1259,63 +1207,6 @@ jobs:
                   }
               }
 
-              private fun buildAutofocusPreview(surfaceProvider: Preview.SurfaceProvider, isRear: Boolean): Preview {
-                  val builder = Preview.Builder()
-                  val interop = Camera2Interop.Extender(builder)
-                  interop.setCaptureRequestOption(
-                      CaptureRequest.CONTROL_AF_MODE,
-                      CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
-                  )
-                  interop.setCaptureRequestOption(
-                      CaptureRequest.CONTROL_AE_MODE,
-                      CaptureRequest.CONTROL_AE_MODE_ON
-                  )
-                  interop.setCaptureRequestOption(
-                      CaptureRequest.CONTROL_AWB_MODE,
-                      CaptureRequest.CONTROL_AWB_MODE_AUTO
-                  )
-
-                  if (isRear) {
-                      interop.setSessionCaptureCallback(object : CameraCaptureSession.CaptureCallback() {
-                          override fun onCaptureCompleted(
-                              session: CameraCaptureSession,
-                              request: CaptureRequest,
-                              result: TotalCaptureResult
-                          ) {
-                              val afState = result.get(CaptureResult.CONTROL_AF_STATE) ?: return
-                              if (afState != lastReportedAfState) {
-                                  lastReportedAfState = afState
-                                  mainHandler.post {
-                                      when (afState) {
-                                          CaptureResult.CONTROL_AF_STATE_PASSIVE_SCAN,
-                                          CaptureResult.CONTROL_AF_STATE_ACTIVE_SCAN -> {
-                                              afStatusBadge.text = "◎ AF FOCUSING"
-                                              afStatusBadge.setTextColor(Color.parseColor("#FDE047"))
-                                              passiveAfBracket.animate().alpha(0.75f).setDuration(120).start()
-                                          }
-                                          CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED,
-                                          CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED -> {
-                                              afStatusBadge.text = "● AF-C LOCKED ✓"
-                                              afStatusBadge.setTextColor(Color.parseColor("#34D399"))
-                                              passiveAfBracket.animate().alpha(0f).setStartDelay(350).setDuration(200).start()
-                                          }
-                                          else -> {
-                                              afStatusBadge.text = "● AF-C READY"
-                                              afStatusBadge.setTextColor(Color.parseColor("#93C5FD"))
-                                              passiveAfBracket.animate().alpha(0f).setDuration(180).start()
-                                          }
-                                      }
-                                  }
-                              }
-                          }
-                      })
-                  }
-
-                  return builder.build().also {
-                      it.setSurfaceProvider(surfaceProvider)
-                  }
-              }
-
               private fun initializeCameraProvider() {
                   val future = ProcessCameraProvider.getInstance(this)
                   future.addListener({
@@ -1334,13 +1225,17 @@ jobs:
                   try {
                       cameraProvider.unbindAll()
 
-                      val pRear = buildAutofocusPreview(previewRear.surfaceProvider, isRear = true)
-                      val pFront = buildAutofocusPreview(previewFront.surfaceProvider, isRear = false)
+                      val pRear = Preview.Builder().build().also {
+                          it.setSurfaceProvider(previewRear.surfaceProvider)
+                      }
+                      val pFront = Preview.Builder().build().also {
+                          it.setSurfaceProvider(previewFront.surfaceProvider)
+                      }
 
-                      val targetRearSelector = when (selectedLensRole) {
-                          "UW" -> buildCameraSelectorForId(ultraWideCameraId)
-                          "TELE" -> buildCameraSelectorForId(telephotoCameraId)
-                          "WIDE" -> buildCameraSelectorForId(mainWideCameraId)
+                      val targetRearSelector: CameraSelector = when (selectedLensRole) {
+                          "UW" -> ultraWideSelector ?: logicalBackSelector
+                          "TELE" -> telephotoSelector ?: logicalBackSelector
+                          "WIDE" -> mainWideSelector ?: logicalBackSelector
                           else -> logicalBackSelector
                       }
 
@@ -1363,7 +1258,6 @@ jobs:
 
                       var boundSuccess = false
 
-                      // 1. Try binding the user's chosen Rear Lens (Logical 3-Lens or UW/Wide/Tele) + Front Camera concurrently
                       if (concurrentFront != null) {
                           try {
                               val primaryConfig = SingleCameraConfig(
@@ -1389,7 +1283,6 @@ jobs:
                           }
                       }
 
-                      // 2. If specific physical lens didn't support concurrent mode, bind the default concurrent pair
                       if (!boundSuccess && concurrentBack != null && concurrentFront != null) {
                           try {
                               val primaryConfig = SingleCameraConfig(
@@ -1415,15 +1308,16 @@ jobs:
                           }
                       }
 
-                      // 3. Fallback to single rear camera if concurrent binding failed
                       if (!boundSuccess) {
                           rearCamera = cameraProvider.bindToLifecycle(this, targetRearSelector, pRear)
                       }
 
-                      // Apply current zoom & trigger initial center autofocus lock
                       mainHandler.postDelayed({
                           setZoomSmooth(currentZoom, fromPresetButton = false)
-                      }, 120)
+                          if (stageCard.width > 0 && stageCard.height > 0) {
+                              triggerTapToFocus(stageCard.width / 2f, stageCard.height / 2f)
+                          }
+                      }, 180)
                   } catch (_: Exception) {
                   } finally {
                       isBindingCameras = false
@@ -1633,9 +1527,10 @@ jobs:
           path: Pixel11-DualSight.apk
 
       - name: Publish Direct Download APK to GitHub Releases
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "v2.0.${{ github.run_number }}" Pixel11-DualSight.apk \
+          gh release create "v3.0.${{ github.run_number }}" Pixel11-DualSight.apk \
             --title "Pixel 11 Pro XL Dual Sight APK (Build #${{ github.run_number }})" \
             --notes "Tap **Pixel11-DualSight.apk** under Assets below to download and install directly on your Pixel 11 Pro XL."
