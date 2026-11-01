@@ -1,0 +1,330 @@
+name: Build Pixel 11 Dual Sight APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Generate Android CameraX Project Files
+        run: |
+          mkdir -p app/src/main/java/com/pixel11/dualsight
+
+          cat << 'EOF' > settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "Pixel11DualSight"
+          include(":app")
+          EOF
+
+          cat << 'EOF' > build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat << 'EOF' > gradle.properties
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          EOF
+
+          cat << 'EOF' > app/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.pixel11.dualsight"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.pixel11.dualsight"
+                  minSdk = 30
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0.0"
+              }
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                      signingConfig = signingConfigs.getByName("debug")
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          dependencies {
+              val cameraxVersion = "1.4.0"
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("com.google.android.material:material:1.12.0")
+              implementation("androidx.camera:camera-core:$cameraxVersion")
+              implementation("androidx.camera:camera-camera2:$cameraxVersion")
+              implementation("androidx.camera:camera-lifecycle:$cameraxVersion")
+              implementation("androidx.camera:camera-view:$cameraxVersion")
+              implementation("androidx.camera:camera-extensions:$cameraxVersion")
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-feature android:name="android.hardware.camera.any" />
+              <uses-feature android:name="android.hardware.camera.concurrent" android:required="false" />
+              <uses-permission android:name="android.permission.CAMERA" />
+              <application
+                  android:allowBackup="true"
+                  android:label="Pixel 11 Dual Sight"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.Material3.Dark.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:colorMode="hdr"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/pixel11/dualsight/MainActivity.kt
+          package com.pixel11.dualsight
+
+          import android.Manifest
+          import android.content.ContentValues
+          import android.content.pm.PackageManager
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.os.Bundle
+          import android.provider.MediaStore
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.Toast
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.camera.core.CameraSelector
+          import androidx.camera.core.ConcurrentCamera.SingleCameraConfig
+          import androidx.camera.core.Preview
+          import androidx.camera.core.UseCaseGroup
+          import androidx.camera.extensions.ExtensionMode
+          import androidx.camera.extensions.ExtensionsManager
+          import androidx.camera.lifecycle.ProcessCameraProvider
+          import androidx.camera.view.PreviewView
+          import androidx.core.content.ContextCompat
+
+          class MainActivity : AppCompatActivity() {
+              private lateinit var previewRear: PreviewView
+              private lateinit var previewFront: PreviewView
+              private var useHdrExtension = true
+
+              private val permissionLauncher = registerForActivityResult(
+                  ActivityResultContracts.RequestPermission()
+              ) { granted ->
+                  if (granted) startDualConcurrentCamera()
+                  else Toast.makeText(this, "Camera permission required", Toast.LENGTH_LONG).show()
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(Color.parseColor("#090A0F"))
+                  }
+
+                  previewRear = PreviewView(this)
+                  previewFront = PreviewView(this)
+
+                  root.addView(previewRear, LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+                  ))
+                  root.addView(previewFront, LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+                  ))
+
+                  val bottomBar = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER
+                      setBackgroundColor(Color.parseColor("#12141C"))
+                      setPadding(24, 24, 24, 24)
+                  }
+
+                  val btnMode = Button(this).apply {
+                      text = "Toggle HDR / Dual"
+                      setOnClickListener {
+                          useHdrExtension = !useHdrExtension
+                          startDualConcurrentCamera()
+                      }
+                  }
+
+                  val btnCapture = Button(this).apply {
+                      text = "Capture Dual Photo"
+                      setOnClickListener { captureDualCompositeToGallery() }
+                  }
+
+                  bottomBar.addView(btnMode)
+                  bottomBar.addView(btnCapture)
+                  root.addView(bottomBar, LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.MATCH_PARENT,
+                      LinearLayout.LayoutParams.WRAP_CONTENT
+                  ))
+
+                  setContentView(root)
+
+                  if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                      startDualConcurrentCamera()
+                  } else {
+                      permissionLauncher.launch(Manifest.permission.CAMERA)
+                  }
+              }
+
+              private fun startDualConcurrentCamera() {
+                  val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+                  cameraProviderFuture.addListener({
+                      val cameraProvider = cameraProviderFuture.get()
+                      val extensionsFuture = ExtensionsManager.getInstanceAsync(this, cameraProvider)
+                      extensionsFuture.addListener({
+                          val extensionsManager = extensionsFuture.get()
+                          cameraProvider.unbindAll()
+
+                          var primaryRearSelector: CameraSelector? = null
+                          var secondaryFrontSelector: CameraSelector? = null
+
+                          for (cameraInfos in cameraProvider.availableConcurrentCameraInfos) {
+                              primaryRearSelector = cameraInfos.firstOrNull {
+                                  it.lensFacing == CameraSelector.LENS_FACING_BACK
+                              }?.cameraSelector
+                              secondaryFrontSelector = cameraInfos.firstOrNull {
+                                  it.lensFacing == CameraSelector.LENS_FACING_FRONT
+                              }?.cameraSelector
+                              if (primaryRearSelector != null && secondaryFrontSelector != null) break
+                          }
+
+                          val rearSelector = primaryRearSelector ?: CameraSelector.DEFAULT_BACK_CAMERA
+                          val frontSelector = secondaryFrontSelector ?: CameraSelector.DEFAULT_FRONT_CAMERA
+
+                          val pRear = Preview.Builder().build().also {
+                              it.setSurfaceProvider(previewRear.surfaceProvider)
+                          }
+                          val pFront = Preview.Builder().build().also {
+                              it.setSurfaceProvider(previewFront.surfaceProvider)
+                          }
+
+                          if (primaryRearSelector != null && secondaryFrontSelector != null) {
+                              val primaryConfig = SingleCameraConfig(
+                                  rearSelector,
+                                  UseCaseGroup.Builder().addUseCase(pRear).build(),
+                                  this
+                              )
+                              val secondaryConfig = SingleCameraConfig(
+                                  frontSelector,
+                                  UseCaseGroup.Builder().addUseCase(pFront).build(),
+                                  this
+                              )
+                              cameraProvider.bindToLifecycle(listOf(primaryConfig, secondaryConfig))
+                              Toast.makeText(this, "Hardware Concurrent Dual-Camera Active", Toast.LENGTH_SHORT).show()
+                          } else {
+                              val hdrRear = if (useHdrExtension && extensionsManager.isExtensionAvailable(rearSelector, ExtensionMode.HDR)) {
+                                  extensionsManager.getExtensionEnabledCameraSelector(rearSelector, ExtensionMode.HDR)
+                              } else rearSelector
+                              cameraProvider.bindToLifecycle(this, hdrRear, pRear)
+                              Toast.makeText(this, "HDR Extension Active", Toast.LENGTH_SHORT).show()
+                          }
+                      }, ContextCompat.getMainExecutor(this))
+                  }, ContextCompat.getMainExecutor(this))
+              }
+
+              private fun captureDualCompositeToGallery() {
+                  val rearBmp = previewRear.bitmap
+                  val frontBmp = previewFront.bitmap
+                  if (rearBmp == null && frontBmp == null) {
+                      Toast.makeText(this, "Preview not ready yet", Toast.LENGTH_SHORT).show()
+                      return
+                  }
+                  val width = maxOf(rearBmp?.width ?: 1080, frontBmp?.width ?: 1080)
+                  val rearH = rearBmp?.height ?: 960
+                  val frontH = frontBmp?.height ?: 960
+                  val combined = Bitmap.createBitmap(width, rearH + frontH, Bitmap.Config.ARGB_8888)
+                  val canvas = Canvas(combined)
+                  rearBmp?.let { canvas.drawBitmap(it, 0f, 0f, null) }
+                  frontBmp?.let { canvas.drawBitmap(it, 0f, rearH.toFloat(), null) }
+
+                  val values = ContentValues().apply {
+                      put(MediaStore.Images.Media.DISPLAY_NAME, "Pixel11_DualSight_" + System.currentTimeMillis() + ".png")
+                      put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                      put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Pixel11DualSight")
+                  }
+                  val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                  if (uri != null) {
+                      contentResolver.openOutputStream(uri)?.use { out ->
+                          combined.compress(Bitmap.CompressFormat.PNG, 100, out)
+                      }
+                      Toast.makeText(this, "Saved Dual Sight photo to Pictures/Pixel11DualSight!", Toast.LENGTH_LONG).show()
+                  }
+              }
+          }
+          EOF
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Gradle 8.7
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.7'
+
+      - name: Compile Android APK
+        run: |
+          gradle assembleDebug
+          cp app/build/outputs/apk/debug/app-debug.apk Pixel11-DualSight.apk
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Pixel11-DualSight-APK
+          path: Pixel11-DualSight.apk
+
+      - name: Publish Direct Download APK to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v1.0.${{ github.run_number }}" Pixel11-DualSight.apk \
+            --title "Pixel 11 Pro XL Dual Sight APK (Build #${{ github.run_number }})" \
+            --notes "Tap **Pixel11-DualSight.apk** under Assets below to download and install directly on your Pixel 11 Pro XL."
