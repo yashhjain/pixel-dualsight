@@ -124,18 +124,37 @@ jobs:
 
           import android.Manifest
           import android.content.ContentValues
+          import android.content.Intent
           import android.content.pm.PackageManager
           import android.graphics.Bitmap
           import android.graphics.Canvas
           import android.graphics.Color
+          import android.graphics.Outline
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.RectF
+          import android.graphics.drawable.GradientDrawable
+          import android.media.MediaActionSound
+          import android.net.Uri
           import android.os.Bundle
           import android.provider.MediaStore
+          import android.util.TypedValue
           import android.view.Gravity
+          import android.view.HapticFeedbackConstants
+          import android.view.MotionEvent
+          import android.view.ScaleGestureDetector
+          import android.view.View
+          import android.view.ViewOutlineProvider
           import android.widget.Button
+          import android.widget.FrameLayout
+          import android.widget.ImageButton
+          import android.widget.ImageView
           import android.widget.LinearLayout
+          import android.widget.TextView
           import android.widget.Toast
           import androidx.activity.result.contract.ActivityResultContracts
           import androidx.appcompat.app.AppCompatActivity
+          import androidx.camera.core.Camera
           import androidx.camera.core.CameraSelector
           import androidx.camera.core.ConcurrentCamera.SingleCameraConfig
           import androidx.camera.core.Preview
@@ -145,11 +164,37 @@ jobs:
           import androidx.camera.lifecycle.ProcessCameraProvider
           import androidx.camera.view.PreviewView
           import androidx.core.content.ContextCompat
+          import kotlin.math.max
+          import kotlin.math.min
 
           class MainActivity : AppCompatActivity() {
+
+              private lateinit var stageLayout: FrameLayout
+              private lateinit var rearContainer: FrameLayout
+              private lateinit var frontContainer: FrameLayout
               private lateinit var previewRear: PreviewView
               private lateinit var previewFront: PreviewView
-              private var useHdrExtension = true
+              private lateinit var flashOverlay: View
+              private lateinit var thumbView: ImageView
+              private lateinit var btnLayoutMode: Button
+              private lateinit var btnPipSize: Button
+              private lateinit var zoomTextBadge: TextView
+
+              private val zoomButtons = mutableMapOf<Float, Button>()
+              private var rearCamera: Camera? = null
+              private var currentZoom = 1.0f
+              private var lastSavedUri: Uri? = null
+              private val shutterSound = MediaActionSound()
+
+              // 0 = PiP Floating Card, 1 = Circle Bubble, 2 = 70/30 Split, 3 = 50/50 Split, 4 = Left/Right Split
+              private var layoutMode = 0
+              private val layoutNames = arrayOf("View: PiP Card", "View: Circle", "View: 70/30", "View: 50/50", "View: Side-by-Side")
+              private var pipScale = 1.0f // 0.75f (S), 1.0f (M), 1.3f (L)
+
+              // Draggable PiP offset
+              private var pipDragX = 0f
+              private var pipDragY = 0f
+              private var hasCustomPipPos = false
 
               private val permissionLauncher = registerForActivityResult(
                   ActivityResultContracts.RequestPermission()
@@ -158,57 +203,375 @@ jobs:
                   else Toast.makeText(this, "Camera permission required", Toast.LENGTH_LONG).show()
               }
 
+              private fun dp(value: Int): Int =
+                  TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, value.toFloat(), resources.displayMetrics).toInt()
+
+              private fun makeRoundedBg(colorHex: String, radiusDp: Int, strokeColorHex: String? = null, strokeWidthDp: Int = 0): GradientDrawable {
+                  return GradientDrawable().apply {
+                      setColor(Color.parseColor(colorHex))
+                      cornerRadius = dp(radiusDp).toFloat()
+                      if (strokeColorHex != null && strokeWidthDp > 0) {
+                          setStroke(dp(strokeWidthDp), Color.parseColor(strokeColorHex))
+                      }
+                  }
+              }
+
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
+                  shutterSound.load(MediaActionSound.SHUTTER_CLICK)
 
                   val root = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
                       setBackgroundColor(Color.parseColor("#090A0F"))
                   }
 
-                  previewRear = PreviewView(this)
-                  previewFront = PreviewView(this)
-
-                  root.addView(previewRear, LinearLayout.LayoutParams(
-                      LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
-                  ))
-                  root.addView(previewFront, LinearLayout.LayoutParams(
-                      LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
-                  ))
-
-                  val bottomBar = LinearLayout(this).apply {
+                  // Top Bar: Mode selector + PiP Size button + Live Zoom Badge
+                  val topBar = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
-                      gravity = Gravity.CENTER
-                      setBackgroundColor(Color.parseColor("#12141C"))
-                      setPadding(24, 24, 24, 24)
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(dp(12), dp(10), dp(12), dp(8))
+                      setBackgroundColor(Color.parseColor("#090A0F"))
                   }
 
-                  val btnMode = Button(this).apply {
-                      text = "Toggle HDR / Dual"
+                  btnLayoutMode = Button(this).apply {
+                      text = layoutNames[layoutMode]
+                      setTextColor(Color.WHITE)
+                      textSize = 12f
+                      background = makeRoundedBg("#2563EB", 20)
+                      setPadding(dp(14), dp(6), dp(14), dp(6))
                       setOnClickListener {
-                          useHdrExtension = !useHdrExtension
-                          startDualConcurrentCamera()
+                          it.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                          layoutMode = (layoutMode + 1) % layoutNames.size
+                          text = layoutNames[layoutMode]
+                          hasCustomPipPos = false
+                          applyFrontCameraLayout()
                       }
                   }
 
-                  val btnCapture = Button(this).apply {
-                      text = "Capture Dual Photo"
-                      setOnClickListener { captureDualCompositeToGallery() }
+                  btnPipSize = Button(this).apply {
+                      text = "Size: M"
+                      setTextColor(Color.WHITE)
+                      textSize = 12f
+                      background = makeRoundedBg("#1E293B", 20, "#334155", 1)
+                      setPadding(dp(12), dp(6), dp(12), dp(6))
+                      setOnClickListener {
+                          it.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                          pipScale = when {
+                              pipScale == 1.0f -> 1.3f
+                              pipScale > 1.0f -> 0.75f
+                              else -> 1.0f
+                          }
+                          text = when {
+                              pipScale > 1.0f -> "Size: L"
+                              pipScale < 1.0f -> "Size: S"
+                              else -> "Size: M"
+                          }
+                          applyFrontCameraLayout()
+                      }
                   }
 
-                  bottomBar.addView(btnMode)
-                  bottomBar.addView(btnCapture)
-                  root.addView(bottomBar, LinearLayout.LayoutParams(
-                      LinearLayout.LayoutParams.MATCH_PARENT,
-                      LinearLayout.LayoutParams.WRAP_CONTENT
-                  ))
+                  zoomTextBadge = TextView(this).apply {
+                      text = "1.0x"
+                      setTextColor(Color.parseColor("#FDE047"))
+                      textSize = 13f
+                      gravity = Gravity.END or Gravity.CENTER_VERTICAL
+                  }
 
+                  topBar.addView(btnLayoutMode, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(38)).apply { rightMargin = dp(8) })
+                  topBar.addView(btnPipSize, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(38)))
+                  topBar.addView(zoomTextBadge, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                  root.addView(topBar, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+                  // Main Viewfinder Stage (FrameLayout supporting both split layouts & draggable floating PiP/Circle)
+                  stageLayout = FrameLayout(this).apply {
+                      setBackgroundColor(Color.BLACK)
+                  }
+
+                  rearContainer = FrameLayout(this)
+                  frontContainer = FrameLayout(this)
+
+                  previewRear = PreviewView(this).apply {
+                      implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+                      scaleType = PreviewView.ScaleType.FILL_CENTER
+                  }
+                  previewFront = PreviewView(this).apply {
+                      implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+                      scaleType = PreviewView.ScaleType.FILL_CENTER
+                  }
+
+                  rearContainer.addView(previewRear, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+                  frontContainer.addView(previewFront, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+
+                  stageLayout.addView(rearContainer)
+                  stageLayout.addView(frontContainer)
+
+                  // Pixel-style Zoom Preset Bar Overlay (0.6x, 1x, 2x, 5x) at bottom of Viewfinder
+                  val zoomBar = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER
+                      background = makeRoundedBg("#AA090A0F", 24, "#33FFFFFF", 1)
+                      setPadding(dp(6), dp(4), dp(6), dp(4))
+                  }
+
+                  val presets = listOf(0.6f to ".6x", 1.0f to "1x", 2.0f to "2x", 5.0f to "5x")
+                  for ((zVal, zLabel) in presets) {
+                      val zBtn = Button(this).apply {
+                          text = zLabel
+                          textSize = 12f
+                          minWidth = dp(44)
+                          minimumWidth = dp(44)
+                          setPadding(dp(8), dp(2), dp(8), dp(2))
+                          setOnClickListener {
+                              it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                              applyZoomRatio(zVal)
+                          }
+                      }
+                      zoomButtons[zVal] = zBtn
+                      zoomBar.addView(zBtn, LinearLayout.LayoutParams(dp(48), dp(36)).apply {
+                          leftMargin = dp(2)
+                          rightMargin = dp(2)
+                      })
+                  }
+                  updateZoomButtonsUI()
+
+                  stageLayout.addView(zoomBar, FrameLayout.LayoutParams(
+                      FrameLayout.LayoutParams.WRAP_CONTENT,
+                      FrameLayout.LayoutParams.WRAP_CONTENT,
+                      Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                  ).apply { bottomMargin = dp(16) })
+
+                  // Pixel Shutter Flash Overlay
+                  flashOverlay = View(this).apply {
+                      setBackgroundColor(Color.WHITE)
+                      alpha = 0f
+                      isClickable = false
+                  }
+                  stageLayout.addView(flashOverlay, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+
+                  root.addView(stageLayout, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+
+                  // Bottom Shutter Deck: Gallery Thumbnail (Left) | Pixel Shutter Ring (Center) | Reset PiP / Swap (Right)
+                  val bottomDeck = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER
+                      setBackgroundColor(Color.parseColor("#12141C"))
+                      setPadding(dp(24), dp(14), dp(24), dp(18))
+                  }
+
+                  // Captured Thumbnail Preview (Bottom-Left)
+                  thumbView = ImageView(this).apply {
+                      scaleType = ImageView.ScaleType.CENTER_CROP
+                      background = makeRoundedBg("#1E293B", 26, "#66FFFFFF", 2)
+                      clipToOutline = true
+                      outlineProvider = object : ViewOutlineProvider() {
+                          override fun getOutline(view: View, outline: Outline) {
+                              outline.setOval(0, 0, view.width, view.height)
+                          }
+                      }
+                      setOnClickListener {
+                          lastSavedUri?.let { uri ->
+                              val intent = Intent(Intent.ACTION_VIEW).apply {
+                                  setDataAndType(uri, "image/png")
+                                  addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                              }
+                              try { startActivity(intent) } catch (_: Exception) {}
+                          } ?: Toast.makeText(this@MainActivity, "Capture a photo first!", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+
+                  // Pixel Shutter Button (Center)
+                  val btnShutter = View(this).apply {
+                      background = makeRoundedBg("#FFFFFF", 40, "#3B82F6", 4)
+                      setOnClickListener { view ->
+                          triggerPixelShutter(view)
+                      }
+                  }
+
+                  // Center/Reset Floating PiP Button (Right)
+                  val btnResetPip = Button(this).apply {
+                      text = "Reset Pos"
+                      setTextColor(Color.WHITE)
+                      textSize = 11f
+                      background = makeRoundedBg("#1E293B", 20, "#334155", 1)
+                      setOnClickListener {
+                          it.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                          hasCustomPipPos = false
+                          applyFrontCameraLayout()
+                          Toast.makeText(this@MainActivity, "Front camera position reset", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+
+                  bottomDeck.addView(thumbView, LinearLayout.LayoutParams(dp(52), dp(52)))
+                  bottomDeck.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+                  bottomDeck.addView(btnShutter, LinearLayout.LayoutParams(dp(74), dp(74)))
+                  bottomDeck.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+                  bottomDeck.addView(btnResetPip, LinearLayout.LayoutParams( LinearLayout.LayoutParams.WRAP_CONTENT, dp(44)))
+
+                  root.addView(bottomDeck, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
                   setContentView(root)
+
+                  stageLayout.post {
+                      applyFrontCameraLayout()
+                  }
+
+                  setupPinchZoomAndPipDrag()
 
                   if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
                       startDualConcurrentCamera()
                   } else {
                       permissionLauncher.launch(Manifest.permission.CAMERA)
+                  }
+              }
+
+              private fun setupPinchZoomAndPipDrag() {
+                  val scaleDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                      override fun onScale(detector: ScaleGestureDetector): Boolean {
+                          val nextZoom = (currentZoom * detector.scaleFactor).coerceIn(0.5f, 8.0f)
+                          applyZoomRatio(nextZoom)
+                          return true
+                      }
+                  })
+
+                  stageLayout.setOnTouchListener { _, event ->
+                      scaleDetector.onTouchEvent(event)
+                      true
+                  }
+
+                  var dX = 0f
+                  var dY = 0f
+                  frontContainer.setOnTouchListener { v, event ->
+                      if (layoutMode != 0 && layoutMode != 1) return@setOnTouchListener false
+                      when (event.actionMasked) {
+                          MotionEvent.ACTION_DOWN -> {
+                              dX = v.x - event.rawX
+                              dY = v.y - event.rawY
+                              true
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              val newX = (event.rawX + dX).coerceIn(dp(8).toFloat(), (stageLayout.width - v.width - dp(8)).toFloat())
+                              val newY = (event.rawY + dY).coerceIn(dp(8).toFloat(), (stageLayout.height - v.height - dp(64)).toFloat())
+                              v.x = newX
+                              v.y = newY
+                              pipDragX = newX
+                              pipDragY = newY
+                              hasCustomPipPos = true
+                              true
+                          }
+                          else -> false
+                      }
+                  }
+              }
+
+              private fun applyZoomRatio(targetZoom: Float) {
+                  currentZoom = targetZoom
+                  zoomTextBadge.text = String.format("%.1fx", currentZoom)
+                  updateZoomButtonsUI()
+
+                  val cam = rearCamera
+                  if (cam != null) {
+                      val zoomState = cam.cameraInfo.zoomState.value
+                      val minZ = zoomState?.minZoomRatio ?: 1.0f
+                      val maxZ = zoomState?.maxZoomRatio ?: 1.0f
+                      if (maxZ > minZ) {
+                          val hwZoom = targetZoom.coerceIn(minZ, maxZ)
+                          cam.cameraControl.setZoomRatio(hwZoom)
+                          val extraScale = (targetZoom / hwZoom).coerceAtLeast(1.0f)
+                          previewRear.scaleX = extraScale
+                          previewRear.scaleY = extraScale
+                          return
+                      }
+                  }
+                  val swScale = targetZoom.coerceAtLeast(1.0f)
+                  previewRear.scaleX = swScale
+                  previewRear.scaleY = swScale
+              }
+
+              private fun updateZoomButtonsUI() {
+                  for ((zVal, btn) in zoomButtons) {
+                      val selected = kotlin.math.abs(currentZoom - zVal) < 0.15f
+                      if (selected) {
+                          btn.setTextColor(Color.BLACK)
+                          btn.background = makeRoundedBg("#FFFFFF", 18)
+                      } else {
+                          btn.setTextColor(Color.WHITE)
+                          btn.background = makeRoundedBg("#00000000", 18)
+                      }
+                  }
+              }
+
+              private fun applyFrontCameraLayout() {
+                  val W = stageLayout.width.takeIf { it > 0 } ?: resources.displayMetrics.widthPixels
+                  val H = stageLayout.height.takeIf { it > 0 } ?: (resources.displayMetrics.heightPixels - dp(160))
+
+                  btnPipSize.visibility = if (layoutMode == 0 || layoutMode == 1) View.VISIBLE else View.GONE
+
+                  when (layoutMode) {
+                      0, 1 -> {
+                          // Full Rear + Floating Card (0) or Floating Circle Bubble (1)
+                          rearContainer.layoutParams = FrameLayout.LayoutParams(W, H, Gravity.TOP or Gravity.START)
+                          val isCircle = (layoutMode == 1)
+                          val baseW = (min(W, H) * (if (isCircle) 0.32f else 0.33f) * pipScale).toInt()
+                          val baseH = if (isCircle) baseW else (baseW * 1.32f).toInt()
+
+                          val lp = FrameLayout.LayoutParams(baseW, baseH, Gravity.TOP or Gravity.START)
+                          frontContainer.layoutParams = lp
+                          frontContainer.background = makeRoundedBg("#000000", if (isCircle) 999 else 22, "#FFFFFFFF", 3)
+                          frontContainer.clipToOutline = true
+                          frontContainer.outlineProvider = object : ViewOutlineProvider() {
+                              override fun getOutline(view: View, outline: Outline) {
+                                  if (isCircle) {
+                                      outline.setOval(0, 0, view.width, view.height)
+                                  } else {
+                                      outline.setRoundRect(0, 0, view.width, view.height, dp(22).toFloat())
+                                  }
+                              }
+                          }
+                          frontContainer.post {
+                              if (hasCustomPipPos) {
+                                  frontContainer.x = pipDragX
+                                  frontContainer.y = pipDragY
+                              } else {
+                                  frontContainer.x = (W - baseW - dp(16)).toFloat()
+                                  frontContainer.y = (H - baseH - dp(76)).toFloat()
+                              }
+                          }
+                      }
+                      2 -> {
+                          // 70 / 30 Split
+                          val splitH = (H * 0.68f).toInt()
+                          rearContainer.layoutParams = FrameLayout.LayoutParams(W, splitH, Gravity.TOP or Gravity.START)
+                          frontContainer.layoutParams = FrameLayout.LayoutParams(W, H - splitH, Gravity.TOP or Gravity.START)
+                          frontContainer.clipToOutline = false
+                          frontContainer.background = null
+                          frontContainer.post {
+                              frontContainer.x = 0f
+                              frontContainer.y = splitH.toFloat()
+                          }
+                      }
+                      3 -> {
+                          // 50 / 50 Top-Bottom Split
+                          val halfH = H / 2
+                          rearContainer.layoutParams = FrameLayout.LayoutParams(W, halfH, Gravity.TOP or Gravity.START)
+                          frontContainer.layoutParams = FrameLayout.LayoutParams(W, H - halfH, Gravity.TOP or Gravity.START)
+                          frontContainer.clipToOutline = false
+                          frontContainer.background = null
+                          frontContainer.post {
+                              frontContainer.x = 0f
+                              frontContainer.y = halfH.toFloat()
+                          }
+                      }
+                      4 -> {
+                          // Side-by-Side (Left / Right Split)
+                          val halfW = W / 2
+                          rearContainer.layoutParams = FrameLayout.LayoutParams(halfW, H, Gravity.TOP or Gravity.START)
+                          frontContainer.layoutParams = FrameLayout.LayoutParams(W - halfW, H, Gravity.TOP or Gravity.START)
+                          frontContainer.clipToOutline = false
+                          frontContainer.background = null
+                          frontContainer.post {
+                              frontContainer.x = halfW.toFloat()
+                              frontContainer.y = 0f
+                          }
+                      }
                   }
               }
 
@@ -255,33 +618,102 @@ jobs:
                                   UseCaseGroup.Builder().addUseCase(pFront).build(),
                                   this
                               )
-                              cameraProvider.bindToLifecycle(listOf(primaryConfig, secondaryConfig))
-                              Toast.makeText(this, "Hardware Concurrent Dual-Camera Active", Toast.LENGTH_SHORT).show()
+                              val concurrentCamera = cameraProvider.bindToLifecycle(listOf(primaryConfig, secondaryConfig))
+                              rearCamera = concurrentCamera.cameras.firstOrNull {
+                                  it.cameraInfo.lensFacing == CameraSelector.LENS_FACING_BACK
+                              } ?: concurrentCamera.cameras.firstOrNull()
                           } else {
-                              val hdrRear = if (useHdrExtension && extensionsManager.isExtensionAvailable(rearSelector, ExtensionMode.HDR)) {
+                              val hdrRear = if (extensionsManager.isExtensionAvailable(rearSelector, ExtensionMode.HDR)) {
                                   extensionsManager.getExtensionEnabledCameraSelector(rearSelector, ExtensionMode.HDR)
                               } else rearSelector
-                              cameraProvider.bindToLifecycle(this, hdrRear, pRear)
-                              Toast.makeText(this, "HDR Extension Active", Toast.LENGTH_SHORT).show()
+                              rearCamera = cameraProvider.bindToLifecycle(this, hdrRear, pRear)
                           }
                       }, ContextCompat.getMainExecutor(this))
                   }, ContextCompat.getMainExecutor(this))
+              }
+
+              private fun triggerPixelShutter(shutterView: View) {
+                  // 1. Pixel Haptic Click + Shutter Button Spring Bounce + Shutter Audio
+                  shutterView.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+                  shutterSound.play(MediaActionSound.SHUTTER_CLICK)
+
+                  shutterView.animate().scaleX(0.86f).scaleY(0.86f).setDuration(75).withEndAction {
+                      shutterView.animate().scaleX(1f).scaleY(1f).setDuration(120).start()
+                  }.start()
+
+                  // 2. Pixel Viewfinder Shutter Flash Animation
+                  flashOverlay.alpha = 0.88f
+                  flashOverlay.animate().alpha(0f).setDuration(240).start()
+
+                  // 3. Composite & Save Photo Matching Exact Active Layout & Position
+                  captureDualCompositeToGallery()
               }
 
               private fun captureDualCompositeToGallery() {
                   val rearBmp = previewRear.bitmap
                   val frontBmp = previewFront.bitmap
                   if (rearBmp == null && frontBmp == null) {
-                      Toast.makeText(this, "Preview not ready yet", Toast.LENGTH_SHORT).show()
+                      Toast.makeText(this, "Camera preview warming up...", Toast.LENGTH_SHORT).show()
                       return
                   }
-                  val width = maxOf(rearBmp?.width ?: 1080, frontBmp?.width ?: 1080)
-                  val rearH = rearBmp?.height ?: 960
-                  val frontH = frontBmp?.height ?: 960
-                  val combined = Bitmap.createBitmap(width, rearH + frontH, Bitmap.Config.ARGB_8888)
+
+                  val outW = stageLayout.width.takeIf { it > 0 } ?: 1080
+                  val outH = stageLayout.height.takeIf { it > 0 } ?: 1440
+                  val combined = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
                   val canvas = Canvas(combined)
-                  rearBmp?.let { canvas.drawBitmap(it, 0f, 0f, null) }
-                  frontBmp?.let { canvas.drawBitmap(it, 0f, rearH.toFloat(), null) }
+                  canvas.drawColor(Color.BLACK)
+                  val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+
+                  // Draw Rear Camera in its container bounds
+                  rearBmp?.let { bmp ->
+                      val dst = RectF(
+                          rearContainer.x,
+                          rearContainer.y,
+                          rearContainer.x + rearContainer.width,
+                          rearContainer.y + rearContainer.height
+                      )
+                      canvas.drawBitmap(bmp, null, dst, paint)
+                  }
+
+                  // Draw Front Camera in its exact container bounds (with Circle or Rounded Card clip if in floating mode!)
+                  frontBmp?.let { bmp ->
+                      val fx = frontContainer.x
+                      val fy = frontContainer.y
+                      val fw = frontContainer.width.toFloat()
+                      val fh = frontContainer.height.toFloat()
+                      val dst = RectF(fx, fy, fx + fw, fy + fh)
+
+                      canvas.save()
+                      val clipPath = Path()
+                      if (layoutMode == 1) {
+                          clipPath.addOval(dst, Path.Direction.CW)
+                          canvas.clipPath(clipPath)
+                      } else if (layoutMode == 0) {
+                          clipPath.addRoundRect(dst, dp(22).toFloat(), dp(22).toFloat(), Path.Direction.CW)
+                          canvas.clipPath(clipPath)
+                      }
+                      canvas.drawBitmap(bmp, null, dst, paint)
+                      canvas.restore()
+
+                      if (layoutMode == 0 || layoutMode == 1) {
+                          val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                              style = Paint.Style.STROKE
+                              color = Color.WHITE
+                              strokeWidth = dp(3).toFloat()
+                          }
+                          if (layoutMode == 1) {
+                              canvas.drawOval(dst, borderPaint)
+                          } else {
+                              canvas.drawRoundRect(dst, dp(22).toFloat(), dp(22).toFloat(), borderPaint)
+                          }
+                      }
+                  }
+
+                  // Update Bottom-Left Gallery Thumbnail with Pixel Pop-In Animation
+                  thumbView.setImageBitmap(combined)
+                  thumbView.scaleX = 0.3f
+                  thumbView.scaleY = 0.3f
+                  thumbView.animate().scaleX(1f).scaleY(1f).setDuration(260).start()
 
                   val values = ContentValues().apply {
                       put(MediaStore.Images.Media.DISPLAY_NAME, "Pixel11_DualSight_" + System.currentTimeMillis() + ".png")
@@ -290,11 +722,17 @@ jobs:
                   }
                   val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
                   if (uri != null) {
+                      lastSavedUri = uri
                       contentResolver.openOutputStream(uri)?.use { out ->
                           combined.compress(Bitmap.CompressFormat.PNG, 100, out)
                       }
-                      Toast.makeText(this, "Saved Dual Sight photo to Pictures/Pixel11DualSight!", Toast.LENGTH_LONG).show()
+                      Toast.makeText(this, "Saved! Tap bottom-left thumbnail to open.", Toast.LENGTH_SHORT).show()
                   }
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  shutterSound.release()
               }
           }
           EOF
