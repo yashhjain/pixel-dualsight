@@ -124,19 +124,27 @@ jobs:
 
           import android.Manifest
           import android.content.ContentValues
+          import android.content.Context
           import android.content.Intent
           import android.content.pm.PackageManager
           import android.graphics.Bitmap
           import android.graphics.Canvas
           import android.graphics.Color
+          import android.graphics.ColorMatrix
+          import android.graphics.ColorMatrixColorFilter
           import android.graphics.Outline
           import android.graphics.Paint
           import android.graphics.Path
           import android.graphics.RectF
+          import android.graphics.RenderEffect
+          import android.graphics.Typeface
           import android.graphics.drawable.GradientDrawable
           import android.media.MediaActionSound
           import android.net.Uri
+          import android.os.Build
           import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
           import android.provider.MediaStore
           import android.util.TypedValue
           import android.view.Gravity
@@ -145,9 +153,8 @@ jobs:
           import android.view.ScaleGestureDetector
           import android.view.View
           import android.view.ViewOutlineProvider
-          import android.widget.Button
           import android.widget.FrameLayout
-          import android.widget.ImageButton
+          import android.widget.HorizontalScrollView
           import android.widget.ImageView
           import android.widget.LinearLayout
           import android.widget.TextView
@@ -157,6 +164,7 @@ jobs:
           import androidx.camera.core.Camera
           import androidx.camera.core.CameraSelector
           import androidx.camera.core.ConcurrentCamera.SingleCameraConfig
+          import androidx.camera.core.FocusMeteringAction
           import androidx.camera.core.Preview
           import androidx.camera.core.UseCaseGroup
           import androidx.camera.extensions.ExtensionMode
@@ -164,34 +172,54 @@ jobs:
           import androidx.camera.lifecycle.ProcessCameraProvider
           import androidx.camera.view.PreviewView
           import androidx.core.content.ContextCompat
-          import kotlin.math.max
+          import kotlin.math.abs
           import kotlin.math.min
 
           class MainActivity : AppCompatActivity() {
 
-              private lateinit var stageLayout: FrameLayout
+              private lateinit var stageCard: FrameLayout
               private lateinit var rearContainer: FrameLayout
               private lateinit var frontContainer: FrameLayout
               private lateinit var previewRear: PreviewView
               private lateinit var previewFront: PreviewView
+              private lateinit var gridOverlayView: GridOverlayView
+              private lateinit var focusRingView: View
               private lateinit var flashOverlay: View
+              private lateinit var countdownLabel: TextView
               private lateinit var thumbView: ImageView
-              private lateinit var btnLayoutMode: Button
-              private lateinit var btnPipSize: Button
+              private lateinit var photoCountBadge: TextView
               private lateinit var zoomTextBadge: TextView
+              private lateinit var btnPipSizeChip: TextView
+              private lateinit var btnFlashChip: TextView
+              private lateinit var btnTimerChip: TextView
+              private lateinit var btnGridChip: TextView
 
-              private val zoomButtons = mutableMapOf<Float, Button>()
+              private val zoomButtons = mutableMapOf<Float, TextView>()
+              private val layoutChips = mutableListOf<TextView>()
+              private val lookChips = mutableListOf<TextView>()
+
               private var rearCamera: Camera? = null
+              private var frontCamera: Camera? = null
               private var currentZoom = 1.0f
+              private var swapSlots = false
+              private var torchEnabled = false
+              private var gridEnabled = false
+              private var timerSeconds = 0
+              private var captureCount = 0
               private var lastSavedUri: Uri? = null
               private val shutterSound = MediaActionSound()
+              private val mainHandler = Handler(Looper.getMainLooper())
 
               // 0 = PiP Floating Card, 1 = Circle Bubble, 2 = 70/30 Split, 3 = 50/50 Split, 4 = Left/Right Split
               private var layoutMode = 0
-              private val layoutNames = arrayOf("View: PiP Card", "View: Circle", "View: 70/30", "View: 50/50", "View: Side-by-Side")
-              private var pipScale = 1.0f // 0.75f (S), 1.0f (M), 1.3f (L)
+              private val layoutLabels = listOf("PiP Card", "Circle Bubble", "70/30 Split", "50/50 Split", "Side-by-Side")
+              private var pipScale = 1.0f // 0.78f (S), 1.0f (M), 1.28f (L)
 
-              // Draggable PiP offset
+              // Color Look Filters (0 = Natural, 1 = Vivid Pop, 2 = Golden Hour, 3 = Cyber Teal, 4 = Leica Mono, 5 = Vintage Film)
+              private var lookIndex = 0
+              private val lookLabels = listOf("Natural", "Vivid Pop", "Golden Hour", "Cyber Teal", "Leica Mono", "Vintage")
+
+              // Draggable PiP coordinates
               private var pipDragX = 0f
               private var pipDragY = 0f
               private var hasCustomPipPos = false
@@ -200,91 +228,118 @@ jobs:
                   ActivityResultContracts.RequestPermission()
               ) { granted ->
                   if (granted) startDualConcurrentCamera()
-                  else Toast.makeText(this, "Camera permission required", Toast.LENGTH_LONG).show()
+                  else Toast.makeText(this, "Camera permission is required", Toast.LENGTH_LONG).show()
               }
 
               private fun dp(value: Int): Int =
                   TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, value.toFloat(), resources.displayMetrics).toInt()
 
-              private fun makeRoundedBg(colorHex: String, radiusDp: Int, strokeColorHex: String? = null, strokeWidthDp: Int = 0): GradientDrawable {
+              private fun pillDrawable(fillHex: String, radiusDp: Int, strokeHex: String? = null, strokeDp: Int = 0): GradientDrawable {
                   return GradientDrawable().apply {
-                      setColor(Color.parseColor(colorHex))
+                      setColor(Color.parseColor(fillHex))
                       cornerRadius = dp(radiusDp).toFloat()
-                      if (strokeColorHex != null && strokeWidthDp > 0) {
-                          setStroke(dp(strokeWidthDp), Color.parseColor(strokeColorHex))
+                      if (strokeHex != null && strokeDp > 0) {
+                          setStroke(dp(strokeDp), Color.parseColor(strokeHex))
+                      }
+                  }
+              }
+
+              private fun circleDrawable(fillHex: String, strokeHex: String? = null, strokeDp: Int = 0): GradientDrawable {
+                  return GradientDrawable().apply {
+                      shape = GradientDrawable.OVAL
+                      setColor(Color.parseColor(fillHex))
+                      if (strokeHex != null && strokeDp > 0) {
+                          setStroke(dp(strokeDp), Color.parseColor(strokeHex))
                       }
                   }
               }
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
+                  window.statusBarColor = Color.parseColor("#07080C")
+                  window.navigationBarColor = Color.parseColor("#07080C")
                   shutterSound.load(MediaActionSound.SHUTTER_CLICK)
 
                   val root = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
-                      setBackgroundColor(Color.parseColor("#090A0F"))
+                      setBackgroundColor(Color.parseColor("#07080C"))
+                      setPadding(dp(10), dp(8), dp(10), dp(10))
                   }
 
-                  // Top Bar: Mode selector + PiP Size button + Live Zoom Badge
-                  val topBar = LinearLayout(this).apply {
+                  // 1. PREMIUM TOP GLASS HUD BAR
+                  val topHud = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
                       gravity = Gravity.CENTER_VERTICAL
-                      setPadding(dp(12), dp(10), dp(12), dp(8))
-                      setBackgroundColor(Color.parseColor("#090A0F"))
+                      background = pillDrawable("#141722", 24, "#24FFFFFF", 1)
+                      setPadding(dp(12), dp(8), dp(12), dp(8))
                   }
 
-                  btnLayoutMode = Button(this).apply {
-                      text = layoutNames[layoutMode]
+                  val brandTitle = TextView(this).apply {
+                      text = "PIXEL PRO • DUAL"
                       setTextColor(Color.WHITE)
-                      textSize = 12f
-                      background = makeRoundedBg("#2563EB", 20)
-                      setPadding(dp(14), dp(6), dp(14), dp(6))
-                      setOnClickListener {
-                          it.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
-                          layoutMode = (layoutMode + 1) % layoutNames.size
-                          text = layoutNames[layoutMode]
-                          hasCustomPipPos = false
-                          applyFrontCameraLayout()
+                      textSize = 11.5f
+                      typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+                      letterSpacing = 0.06f
+                  }
+
+                  btnFlashChip = buildTopUtilityChip("⚡ Off") {
+                      torchEnabled = !torchEnabled
+                      rearCamera?.cameraControl?.enableTorch(torchEnabled)
+                      btnFlashChip.text = if (torchEnabled) "⚡ On" else "⚡ Off"
+                      btnFlashChip.background = if (torchEnabled) pillDrawable("#F59E0B", 16) else pillDrawable("#222634", 16)
+                      btnFlashChip.setTextColor(if (torchEnabled) Color.BLACK else Color.WHITE)
+                  }
+
+                  btnTimerChip = buildTopUtilityChip("⏱ Off") {
+                      timerSeconds = when (timerSeconds) {
+                          0 -> 3
+                          3 -> 5
+                          else -> 0
                       }
+                      btnTimerChip.text = if (timerSeconds == 0) "⏱ Off" else "⏱ ${timerSeconds}s"
+                      btnTimerChip.background = if (timerSeconds > 0) pillDrawable("#3B82F6", 16) else pillDrawable("#222634", 16)
                   }
 
-                  btnPipSize = Button(this).apply {
-                      text = "Size: M"
-                      setTextColor(Color.WHITE)
-                      textSize = 12f
-                      background = makeRoundedBg("#1E293B", 20, "#334155", 1)
-                      setPadding(dp(12), dp(6), dp(12), dp(6))
-                      setOnClickListener {
-                          it.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
-                          pipScale = when {
-                              pipScale == 1.0f -> 1.3f
-                              pipScale > 1.0f -> 0.75f
-                              else -> 1.0f
-                          }
-                          text = when {
-                              pipScale > 1.0f -> "Size: L"
-                              pipScale < 1.0f -> "Size: S"
-                              else -> "Size: M"
-                          }
-                          applyFrontCameraLayout()
+                  btnGridChip = buildTopUtilityChip("# Grid") {
+                      gridEnabled = !gridEnabled
+                      gridOverlayView.visibility = if (gridEnabled) View.VISIBLE else View.GONE
+                      btnGridChip.background = if (gridEnabled) pillDrawable("#3B82F6", 16) else pillDrawable("#222634", 16)
+                  }
+
+                  btnPipSizeChip = buildTopUtilityChip("PiP: M") {
+                      pipScale = when {
+                          pipScale == 1.0f -> 1.28f
+                          pipScale > 1.0f -> 0.78f
+                          else -> 1.0f
                       }
+                      val sizeTag = when {
+                          pipScale > 1.0f -> "L"
+                          pipScale < 1.0f -> "S"
+                          else -> "M"
+                      }
+                      btnPipSizeChip.text = "PiP: $sizeTag"
+                      applyFrontCameraLayout()
                   }
 
-                  zoomTextBadge = TextView(this).apply {
-                      text = "1.0x"
-                      setTextColor(Color.parseColor("#FDE047"))
-                      textSize = 13f
-                      gravity = Gravity.END or Gravity.CENTER_VERTICAL
-                  }
+                  topHud.addView(brandTitle, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                  topHud.addView(btnFlashChip, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(30)).apply { rightMargin = dp(6) })
+                  topHud.addView(btnTimerChip, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(30)).apply { rightMargin = dp(6) })
+                  topHud.addView(btnGridChip, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(30)).apply { rightMargin = dp(6) })
+                  topHud.addView(btnPipSizeChip, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(30)))
 
-                  topBar.addView(btnLayoutMode, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(38)).apply { rightMargin = dp(8) })
-                  topBar.addView(btnPipSize, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(38)))
-                  topBar.addView(zoomTextBadge, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-                  root.addView(topBar, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+                  root.addView(topHud, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                      bottomMargin = dp(8)
+                  })
 
-                  // Main Viewfinder Stage (FrameLayout supporting both split layouts & draggable floating PiP/Circle)
-                  stageLayout = FrameLayout(this).apply {
-                      setBackgroundColor(Color.BLACK)
+                  // 2. ROUNDED 28DP FLAGSHIP VIEWFINDER STAGE
+                  stageCard = FrameLayout(this).apply {
+                      background = pillDrawable("#000000", 28, "#29FFFFFF", 1)
+                      clipToOutline = true
+                      outlineProvider = object : ViewOutlineProvider() {
+                          override fun getOutline(view: View, outline: Outline) {
+                              outline.setRoundRect(0, 0, view.width, view.height, dp(28).toFloat())
+                          }
+                      }
                   }
 
                   rearContainer = FrameLayout(this)
@@ -302,66 +357,209 @@ jobs:
                   rearContainer.addView(previewRear, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
                   frontContainer.addView(previewFront, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
 
-                  stageLayout.addView(rearContainer)
-                  stageLayout.addView(frontContainer)
+                  stageCard.addView(rearContainer)
+                  stageCard.addView(frontContainer)
 
-                  // Pixel-style Zoom Preset Bar Overlay (0.6x, 1x, 2x, 5x) at bottom of Viewfinder
-                  val zoomBar = LinearLayout(this).apply {
+                  // 3x3 Rule-of-Thirds Grid Overlay
+                  gridOverlayView = GridOverlayView(this).apply {
+                      visibility = View.GONE
+                  }
+                  stageCard.addView(gridOverlayView, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+
+                  // Tap-to-Focus Ring Indicator
+                  focusRingView = View(this).apply {
+                      background = circleDrawable("#00000000", "#FACC15", 2)
+                      alpha = 0f
+                  }
+                  stageCard.addView(focusRingView, FrameLayout.LayoutParams(dp(64), dp(64)))
+
+                  // Top-Left & Top-Right Live Sensor Pills inside Viewfinder
+                  val lensBadgesRow = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
-                      gravity = Gravity.CENTER
-                      background = makeRoundedBg("#AA090A0F", 24, "#33FFFFFF", 1)
-                      setPadding(dp(6), dp(4), dp(6), dp(4))
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(dp(14), dp(12), dp(14), dp(8))
                   }
 
-                  val presets = listOf(0.6f to ".6x", 1.0f to "1x", 2.0f to "2x", 5.0f to "5x")
+                  val rearBadge = TextView(this).apply {
+                      text = "● REAR 50MP HDR"
+                      setTextColor(Color.parseColor("#A7F3D0"))
+                      textSize = 10.5f
+                      typeface = Typeface.MONOSPACE
+                      background = pillDrawable("#99090A0F", 14, "#33FFFFFF", 1)
+                      setPadding(dp(10), dp(4), dp(10), dp(4))
+                  }
+
+                  zoomTextBadge = TextView(this).apply {
+                      text = "1.0x"
+                      setTextColor(Color.parseColor("#FDE047"))
+                      textSize = 11.5f
+                      typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+                      background = pillDrawable("#99090A0F", 14, "#44FDE047", 1)
+                      setPadding(dp(10), dp(4), dp(10), dp(4))
+                  }
+
+                  lensBadgesRow.addView(rearBadge)
+                  lensBadgesRow.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+                  lensBadgesRow.addView(zoomTextBadge)
+                  stageCard.addView(lensBadgesRow, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP))
+
+                  // Pixel Flagship Floating Zoom Pill Dock (.6x, 1x, 2x, 5x, 10x)
+                  val zoomDock = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER
+                      background = pillDrawable("#B80D0F17", 28, "#33FFFFFF", 1)
+                      setPadding(dp(6), dp(5), dp(6), dp(5))
+                  }
+
+                  val presets = listOf(0.6f to ".6", 1.0f to "1x", 2.0f to "2x", 5.0f to "5x", 10.0f to "10x")
                   for ((zVal, zLabel) in presets) {
-                      val zBtn = Button(this).apply {
+                      val pill = TextView(this).apply {
                           text = zLabel
-                          textSize = 12f
-                          minWidth = dp(44)
-                          minimumWidth = dp(44)
-                          setPadding(dp(8), dp(2), dp(8), dp(2))
+                          gravity = Gravity.CENTER
+                          textSize = 11.5f
+                          typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
                           setOnClickListener {
                               it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
                               applyZoomRatio(zVal)
                           }
                       }
-                      zoomButtons[zVal] = zBtn
-                      zoomBar.addView(zBtn, LinearLayout.LayoutParams(dp(48), dp(36)).apply {
+                      zoomButtons[zVal] = pill
+                      zoomDock.addView(pill, LinearLayout.LayoutParams(dp(40), dp(34)).apply {
                           leftMargin = dp(2)
                           rightMargin = dp(2)
                       })
                   }
                   updateZoomButtonsUI()
 
-                  stageLayout.addView(zoomBar, FrameLayout.LayoutParams(
+                  stageCard.addView(zoomDock, FrameLayout.LayoutParams(
                       FrameLayout.LayoutParams.WRAP_CONTENT,
                       FrameLayout.LayoutParams.WRAP_CONTENT,
                       Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-                  ).apply { bottomMargin = dp(16) })
+                  ).apply { bottomMargin = dp(14) })
 
-                  // Pixel Shutter Flash Overlay
+                  // Center Countdown Overlay Text
+                  countdownLabel = TextView(this).apply {
+                      text = "3"
+                      textSize = 68f
+                      setTextColor(Color.WHITE)
+                      typeface = Typeface.create("sans-serif-black", Typeface.BOLD)
+                      gravity = Gravity.CENTER
+                      visibility = View.GONE
+                  }
+                  stageCard.addView(countdownLabel, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+
+                  // Shutter Rim & Screen Flash Overlay
                   flashOverlay = View(this).apply {
-                      setBackgroundColor(Color.WHITE)
+                      background = pillDrawable("#FFFFFF", 28, "#3B82F6", 6)
                       alpha = 0f
                       isClickable = false
                   }
-                  stageLayout.addView(flashOverlay, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+                  stageCard.addView(flashOverlay, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
 
-                  root.addView(stageLayout, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+                  root.addView(stageCard, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
 
-                  // Bottom Shutter Deck: Gallery Thumbnail (Left) | Pixel Shutter Ring (Center) | Reset PiP / Swap (Right)
+                  // 3. BOTTOM CAMERA DECK: LOOKS CAROUSEL + VIEW LAYOUT CAROUSEL + ICONIC SHUTTER BAR
                   val bottomDeck = LinearLayout(this).apply {
-                      orientation = LinearLayout.HORIZONTAL
-                      gravity = Gravity.CENTER
-                      setBackgroundColor(Color.parseColor("#12141C"))
-                      setPadding(dp(24), dp(14), dp(24), dp(18))
+                      orientation = LinearLayout.VERTICAL
+                      background = pillDrawable("#11131C", 28, "#1FFFFFFF", 1)
+                      setPadding(dp(12), dp(10), dp(12), dp(12))
                   }
 
-                  // Captured Thumbnail Preview (Bottom-Left)
+                  // Row A: Color Looks Strip ("Natural", "Vivid Pop", "Golden Hour", "Cyber Teal", "Leica Mono", "Vintage")
+                  val looksScroll = HorizontalScrollView(this).apply {
+                      isHorizontalScrollBarEnabled = false
+                  }
+                  val looksRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                  }
+                  val lookTitle = TextView(this).apply {
+                      text = "LOOK"
+                      textSize = 10f
+                      setTextColor(Color.parseColor("#94A3B8"))
+                      typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+                      setPadding(dp(4), 0, dp(8), 0)
+                  }
+                  looksRow.addView(lookTitle)
+
+                  lookLabels.forEachIndexed { idx, label ->
+                      val chip = TextView(this).apply {
+                          text = label
+                          textSize = 11.5f
+                          gravity = Gravity.CENTER
+                          setPadding(dp(12), dp(5), dp(12), dp(5))
+                          setOnClickListener {
+                              it.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                              lookIndex = idx
+                              applyLiveLookFilter()
+                              updateLookChipsUI()
+                          }
+                      }
+                      lookChips.add(chip)
+                      looksRow.addView(chip, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(30)).apply {
+                          rightMargin = dp(6)
+                      })
+                  }
+                  updateLookChipsUI()
+                  looksScroll.addView(looksRow)
+                  bottomDeck.addView(looksScroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                      bottomMargin = dp(8)
+                  })
+
+                  // Row B: Front Camera View Layout Strip ("PiP Card", "Circle Bubble", "70/30 Split", "50/50 Split", "Side-by-Side")
+                  val layoutsScroll = HorizontalScrollView(this).apply {
+                      isHorizontalScrollBarEnabled = false
+                  }
+                  val layoutsRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                  }
+                  val layoutTitle = TextView(this).apply {
+                      text = "VIEW"
+                      textSize = 10f
+                      setTextColor(Color.parseColor("#94A3B8"))
+                      typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+                      setPadding(dp(4), 0, dp(8), 0)
+                  }
+                  layoutsRow.addView(layoutTitle)
+
+                  layoutLabels.forEachIndexed { idx, label ->
+                      val chip = TextView(this).apply {
+                          text = label
+                          textSize = 11.5f
+                          gravity = Gravity.CENTER
+                          setPadding(dp(12), dp(5), dp(12), dp(5))
+                          setOnClickListener {
+                              it.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                              layoutMode = idx
+                              hasCustomPipPos = false
+                              applyFrontCameraLayout()
+                              updateLayoutChipsUI()
+                          }
+                      }
+                      layoutChips.add(chip)
+                      layoutsRow.addView(chip, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(30)).apply {
+                          rightMargin = dp(6)
+                      })
+                  }
+                  updateLayoutChipsUI()
+                  layoutsScroll.addView(layoutsRow)
+                  bottomDeck.addView(layoutsScroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                      bottomMargin = dp(10)
+                  })
+
+                  // Row C: Flagship Shutter Bar (Gallery Thumbnail Well | Double-Ring Pixel Shutter | Swap Front/Rear Button)
+                  val shutterRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(dp(12), dp(2), dp(12), dp(2))
+                  }
+
+                  // Left: Gallery Thumbnail Well + Count Badge
+                  val galleryWellFrame = FrameLayout(this)
                   thumbView = ImageView(this).apply {
                       scaleType = ImageView.ScaleType.CENTER_CROP
-                      background = makeRoundedBg("#1E293B", 26, "#66FFFFFF", 2)
+                      background = circleDrawable("#1E293B", "#80FFFFFF", 2)
                       clipToOutline = true
                       outlineProvider = object : ViewOutlineProvider() {
                           override fun getOutline(view: View, outline: Outline) {
@@ -375,46 +573,71 @@ jobs:
                                   addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                               }
                               try { startActivity(intent) } catch (_: Exception) {}
-                          } ?: Toast.makeText(this@MainActivity, "Capture a photo first!", Toast.LENGTH_SHORT).show()
+                          } ?: Toast.makeText(this@MainActivity, "Tap the center shutter to capture a Dual Sight photo!", Toast.LENGTH_SHORT).show()
                       }
                   }
-
-                  // Pixel Shutter Button (Center)
-                  val btnShutter = View(this).apply {
-                      background = makeRoundedBg("#FFFFFF", 40, "#3B82F6", 4)
-                      setOnClickListener { view ->
-                          triggerPixelShutter(view)
-                      }
-                  }
-
-                  // Center/Reset Floating PiP Button (Right)
-                  val btnResetPip = Button(this).apply {
-                      text = "Reset Pos"
+                  photoCountBadge = TextView(this).apply {
+                      text = "0"
+                      textSize = 10f
                       setTextColor(Color.WHITE)
-                      textSize = 11f
-                      background = makeRoundedBg("#1E293B", 20, "#334155", 1)
+                      gravity = Gravity.CENTER
+                      background = circleDrawable("#2563EB", "#07080C", 2)
+                      visibility = View.GONE
+                  }
+                  galleryWellFrame.addView(thumbView, FrameLayout.LayoutParams(dp(54), dp(54), Gravity.CENTER))
+                  galleryWellFrame.addView(photoCountBadge, FrameLayout.LayoutParams(dp(20), dp(20), Gravity.TOP or Gravity.END))
+
+                  // Center: Flagship Double-Ring Pixel Shutter Button
+                  val shutterOuterRing = FrameLayout(this).apply {
+                      background = circleDrawable("#00000000", "#FFFFFF", 3)
+                      setPadding(dp(5), dp(5), dp(5), dp(5))
+                  }
+                  val shutterInnerDisc = View(this).apply {
+                      background = circleDrawable("#F8FAFC", "#CBD5E1", 2)
+                  }
+                  shutterOuterRing.addView(shutterInnerDisc, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+                  shutterOuterRing.setOnClickListener {
+                      triggerPixelShutterSequence(shutterInnerDisc)
+                  }
+
+                  // Right: Swap Primary/Secondary Cameras Button
+                  val btnSwapCams = TextView(this).apply {
+                      text = "⇅ Swap"
+                      textSize = 12f
+                      setTextColor(Color.WHITE)
+                      gravity = Gravity.CENTER
+                      typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+                      background = pillDrawable("#1E293B", 27, "#33FFFFFF", 1)
                       setOnClickListener {
                           it.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
-                          hasCustomPipPos = false
+                          swapSlots = !swapSlots
                           applyFrontCameraLayout()
-                          Toast.makeText(this@MainActivity, "Front camera position reset", Toast.LENGTH_SHORT).show()
+                          Toast.makeText(
+                              this@MainActivity,
+                              if (swapSlots) "Swapped: Front Main + Rear PiP" else "Swapped: Rear Main + Front PiP",
+                              Toast.LENGTH_SHORT
+                          ).show()
                       }
                   }
 
-                  bottomDeck.addView(thumbView, LinearLayout.LayoutParams(dp(52), dp(52)))
-                  bottomDeck.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
-                  bottomDeck.addView(btnShutter, LinearLayout.LayoutParams(dp(74), dp(74)))
-                  bottomDeck.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
-                  bottomDeck.addView(btnResetPip, LinearLayout.LayoutParams( LinearLayout.LayoutParams.WRAP_CONTENT, dp(44)))
+                  shutterRow.addView(galleryWellFrame, LinearLayout.LayoutParams(dp(60), dp(60)))
+                  shutterRow.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+                  shutterRow.addView(shutterOuterRing, LinearLayout.LayoutParams(dp(76), dp(76)))
+                  shutterRow.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+                  shutterRow.addView(btnSwapCams, LinearLayout.LayoutParams(dp(68), dp(50)))
 
-                  root.addView(bottomDeck, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+                  bottomDeck.addView(shutterRow, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+                  root.addView(bottomDeck, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                      topMargin = dp(8)
+                  })
+
                   setContentView(root)
 
-                  stageLayout.post {
+                  stageCard.post {
                       applyFrontCameraLayout()
                   }
 
-                  setupPinchZoomAndPipDrag()
+                  setupTouchGestures()
 
                   if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
                       startDualConcurrentCamera()
@@ -423,43 +646,186 @@ jobs:
                   }
               }
 
-              private fun setupPinchZoomAndPipDrag() {
+              private fun buildTopUtilityChip(label: String, onClick: () -> Unit): TextView {
+                  return TextView(this).apply {
+                      text = label
+                      textSize = 11f
+                      setTextColor(Color.WHITE)
+                      gravity = Gravity.CENTER
+                      typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                      background = pillDrawable("#222634", 16)
+                      setPadding(dp(10), dp(4), dp(10), dp(4))
+                      setOnClickListener {
+                          it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                          onClick()
+                      }
+                  }
+              }
+
+              private fun updateLookChipsUI() {
+                  lookChips.forEachIndexed { idx, chip ->
+                      if (idx == lookIndex) {
+                          chip.setTextColor(Color.BLACK)
+                          chip.background = pillDrawable("#FACC15", 16)
+                          chip.typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+                      } else {
+                          chip.setTextColor(Color.parseColor("#E2E8F0"))
+                          chip.background = pillDrawable("#1E2230", 16, "#26FFFFFF", 1)
+                          chip.typeface = Typeface.create("sans-serif", Typeface.NORMAL)
+                      }
+                  }
+              }
+
+              private fun updateLayoutChipsUI() {
+                  layoutChips.forEachIndexed { idx, chip ->
+                      if (idx == layoutMode) {
+                          chip.setTextColor(Color.WHITE)
+                          chip.background = pillDrawable("#2563EB", 16)
+                          chip.typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+                      } else {
+                          chip.setTextColor(Color.parseColor("#E2E8F0"))
+                          chip.background = pillDrawable("#1E2230", 16, "#26FFFFFF", 1)
+                          chip.typeface = Typeface.create("sans-serif", Typeface.NORMAL)
+                      }
+                  }
+              }
+
+              private fun getSelectedColorMatrix(): ColorMatrix {
+                  return when (lookIndex) {
+                      1 -> {
+                          // Vivid Pop: Boosted saturation + contrast punch
+                          ColorMatrix().apply { setSaturation(1.45f) }
+                      }
+                      2 -> {
+                          // Golden Hour: Warm amber/gold highlights
+                          ColorMatrix(floatArrayOf(
+                              1.15f, 0.05f, 0f, 0f, 12f,
+                              0.02f, 1.05f, 0f, 0f, 6f,
+                              0f, 0f, 0.85f, 0f, -8f,
+                              0f, 0f, 0f, 1f, 0f
+                          ))
+                      }
+                      3 -> {
+                          // Cyber Teal: Crisp cinema teal & orange grade
+                          ColorMatrix(floatArrayOf(
+                              1.08f, -0.04f, 0f, 0f, 0f,
+                              0f, 1.08f, 0.06f, 0f, 4f,
+                              -0.05f, 0.08f, 1.18f, 0f, 10f,
+                              0f, 0f, 0f, 1f, 0f
+                          ))
+                      }
+                      4 -> {
+                          // Leica Mono: High-contrast black and white
+                          val bw = ColorMatrix().apply { setSaturation(0f) }
+                          val contrast = ColorMatrix(floatArrayOf(
+                              1.25f, 0f, 0f, 0f, -20f,
+                              0f, 1.25f, 0f, 0f, -20f,
+                              0f, 0f, 1.25f, 0f, -20f,
+                              0f, 0f, 0f, 1f, 0f
+                          ))
+                          bw.postConcat(contrast)
+                          bw
+                      }
+                      5 -> {
+                          // Vintage Film: Classic warm faded film curve
+                          ColorMatrix(floatArrayOf(
+                              0.95f, 0.18f, 0.05f, 0f, 14f,
+                              0.08f, 0.92f, 0.05f, 0f, 10f,
+                              0.04f, 0.08f, 0.78f, 0f, 18f,
+                              0f, 0f, 0f, 1f, 0f
+                          ))
+                      }
+                      else -> ColorMatrix()
+                  }
+              }
+
+              private fun applyLiveLookFilter() {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                      if (lookIndex == 0) {
+                          rearContainer.setRenderEffect(null)
+                          frontContainer.setRenderEffect(null)
+                      } else {
+                          val filter = ColorMatrixColorFilter(getSelectedColorMatrix())
+                          val effect = RenderEffect.createColorFilterEffect(filter)
+                          rearContainer.setRenderEffect(effect)
+                          frontContainer.setRenderEffect(effect)
+                      }
+                  }
+              }
+
+              private fun setupTouchGestures() {
                   val scaleDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
                       override fun onScale(detector: ScaleGestureDetector): Boolean {
-                          val nextZoom = (currentZoom * detector.scaleFactor).coerceIn(0.5f, 8.0f)
+                          val nextZoom = (currentZoom * detector.scaleFactor).coerceIn(0.6f, 10.0f)
                           applyZoomRatio(nextZoom)
                           return true
                       }
                   })
 
-                  stageLayout.setOnTouchListener { _, event ->
+                  stageCard.setOnTouchListener { _, event ->
                       scaleDetector.onTouchEvent(event)
+                      if (!scaleDetector.isInProgress && event.actionMasked == MotionEvent.ACTION_UP) {
+                          showTapFocusRing(event.x, event.y)
+                      }
                       true
                   }
 
                   var dX = 0f
                   var dY = 0f
-                  frontContainer.setOnTouchListener { v, event ->
-                      if (layoutMode != 0 && layoutMode != 1) return@setOnTouchListener false
-                      when (event.actionMasked) {
-                          MotionEvent.ACTION_DOWN -> {
-                              dX = v.x - event.rawX
-                              dY = v.y - event.rawY
-                              true
+                  var moved = false
+                  val attachDrag = { targetView: FrameLayout ->
+                      targetView.setOnTouchListener { v, event ->
+                          val isFloating = (layoutMode == 0 || layoutMode == 1)
+                          val secondaryContainer = if (swapSlots) rearContainer else frontContainer
+                          if (!isFloating || v !== secondaryContainer) return@setOnTouchListener false
+
+                          when (event.actionMasked) {
+                              MotionEvent.ACTION_DOWN -> {
+                                  dX = v.x - event.rawX
+                                  dY = v.y - event.rawY
+                                  moved = false
+                                  true
+                              }
+                              MotionEvent.ACTION_MOVE -> {
+                                  val newX = (event.rawX + dX).coerceIn(dp(10).toFloat(), (stageCard.width - v.width - dp(10)).toFloat())
+                                  val newY = (event.rawY + dY).coerceIn(dp(44).toFloat(), (stageCard.height - v.height - dp(62)).toFloat())
+                                  if (abs(newX - v.x) > 3f || abs(newY - v.y) > 3f) moved = true
+                                  v.x = newX
+                                  v.y = newY
+                                  pipDragX = newX
+                                  pipDragY = newY
+                                  hasCustomPipPos = true
+                                  true
+                              }
+                              MotionEvent.ACTION_UP -> moved
+                              else -> false
                           }
-                          MotionEvent.ACTION_MOVE -> {
-                              val newX = (event.rawX + dX).coerceIn(dp(8).toFloat(), (stageLayout.width - v.width - dp(8)).toFloat())
-                              val newY = (event.rawY + dY).coerceIn(dp(8).toFloat(), (stageLayout.height - v.height - dp(64)).toFloat())
-                              v.x = newX
-                              v.y = newY
-                              pipDragX = newX
-                              pipDragY = newY
-                              hasCustomPipPos = true
-                              true
-                          }
-                          else -> false
                       }
                   }
+                  attachDrag(frontContainer)
+                  attachDrag(rearContainer)
+              }
+
+              private fun showTapFocusRing(x: Float, y: Float) {
+                  focusRingView.x = x - focusRingView.width / 2f
+                  focusRingView.y = y - focusRingView.height / 2f
+                  focusRingView.scaleX = 1.35f
+                  focusRingView.scaleY = 1.35f
+                  focusRingView.alpha = 1f
+                  focusRingView.animate()
+                      .scaleX(1f)
+                      .scaleY(1f)
+                      .setDuration(180)
+                      .withEndAction {
+                          focusRingView.animate().alpha(0f).setStartDelay(550).setDuration(250).start()
+                      }
+                      .start()
+
+                  try {
+                      val point = previewRear.meteringPointFactory.createPoint(x, y)
+                      val action = FocusMeteringAction.Builder(point).build()
+                      rearCamera?.cameraControl?.startFocusAndMetering(action)
+                  } catch (_: Exception) {}
               }
 
               private fun applyZoomRatio(targetZoom: Float) {
@@ -487,90 +853,107 @@ jobs:
               }
 
               private fun updateZoomButtonsUI() {
-                  for ((zVal, btn) in zoomButtons) {
-                      val selected = kotlin.math.abs(currentZoom - zVal) < 0.15f
+                  for ((zVal, pill) in zoomButtons) {
+                      val selected = abs(currentZoom - zVal) < 0.15f
                       if (selected) {
-                          btn.setTextColor(Color.BLACK)
-                          btn.background = makeRoundedBg("#FFFFFF", 18)
+                          pill.setTextColor(Color.BLACK)
+                          pill.background = circleDrawable("#FACC15")
+                          pill.scaleX = 1.08f
+                          pill.scaleY = 1.08f
                       } else {
-                          btn.setTextColor(Color.WHITE)
-                          btn.background = makeRoundedBg("#00000000", 18)
+                          pill.setTextColor(Color.WHITE)
+                          pill.background = circleDrawable("#26FFFFFF")
+                          pill.scaleX = 1.0f
+                          pill.scaleY = 1.0f
                       }
                   }
               }
 
               private fun applyFrontCameraLayout() {
-                  val W = stageLayout.width.takeIf { it > 0 } ?: resources.displayMetrics.widthPixels
-                  val H = stageLayout.height.takeIf { it > 0 } ?: (resources.displayMetrics.heightPixels - dp(160))
+                  val W = stageCard.width.takeIf { it > 0 } ?: (resources.displayMetrics.widthPixels - dp(20))
+                  val H = stageCard.height.takeIf { it > 0 } ?: (resources.displayMetrics.heightPixels - dp(240))
 
-                  btnPipSize.visibility = if (layoutMode == 0 || layoutMode == 1) View.VISIBLE else View.GONE
+                  val primaryContainer = if (swapSlots) frontContainer else rearContainer
+                  val secondaryContainer = if (swapSlots) rearContainer else frontContainer
+
+                  // Ensure secondary is drawn above primary in FrameLayout z-order
+                  primaryContainer.elevation = dp(1).toFloat()
+                  secondaryContainer.elevation = dp(8).toFloat()
+
+                  btnPipSizeChip.visibility = if (layoutMode == 0 || layoutMode == 1) View.VISIBLE else View.GONE
 
                   when (layoutMode) {
                       0, 1 -> {
-                          // Full Rear + Floating Card (0) or Floating Circle Bubble (1)
-                          rearContainer.layoutParams = FrameLayout.LayoutParams(W, H, Gravity.TOP or Gravity.START)
+                          // Full Primary + Draggable Floating Card (0) or Circle Bubble (1)
+                          primaryContainer.layoutParams = FrameLayout.LayoutParams(W, H, Gravity.TOP or Gravity.START)
+                          primaryContainer.clipToOutline = false
+                          primaryContainer.background = null
+                          primaryContainer.post {
+                              primaryContainer.x = 0f
+                              primaryContainer.y = 0f
+                          }
+
                           val isCircle = (layoutMode == 1)
                           val baseW = (min(W, H) * (if (isCircle) 0.32f else 0.33f) * pipScale).toInt()
                           val baseH = if (isCircle) baseW else (baseW * 1.32f).toInt()
 
-                          val lp = FrameLayout.LayoutParams(baseW, baseH, Gravity.TOP or Gravity.START)
-                          frontContainer.layoutParams = lp
-                          frontContainer.background = makeRoundedBg("#000000", if (isCircle) 999 else 22, "#FFFFFFFF", 3)
-                          frontContainer.clipToOutline = true
-                          frontContainer.outlineProvider = object : ViewOutlineProvider() {
+                          secondaryContainer.layoutParams = FrameLayout.LayoutParams(baseW, baseH, Gravity.TOP or Gravity.START)
+                          secondaryContainer.background = pillDrawable("#000000", if (isCircle) 999 else 24, "#FFFFFFFF", 3)
+                          secondaryContainer.clipToOutline = true
+                          secondaryContainer.outlineProvider = object : ViewOutlineProvider() {
                               override fun getOutline(view: View, outline: Outline) {
                                   if (isCircle) {
                                       outline.setOval(0, 0, view.width, view.height)
                                   } else {
-                                      outline.setRoundRect(0, 0, view.width, view.height, dp(22).toFloat())
+                                      outline.setRoundRect(0, 0, view.width, view.height, dp(24).toFloat())
                                   }
                               }
                           }
-                          frontContainer.post {
+                          secondaryContainer.post {
                               if (hasCustomPipPos) {
-                                  frontContainer.x = pipDragX
-                                  frontContainer.y = pipDragY
+                                  secondaryContainer.x = pipDragX
+                                  secondaryContainer.y = pipDragY
                               } else {
-                                  frontContainer.x = (W - baseW - dp(16)).toFloat()
-                                  frontContainer.y = (H - baseH - dp(76)).toFloat()
+                                  secondaryContainer.x = (W - baseW - dp(16)).toFloat()
+                                  secondaryContainer.y = (H - baseH - dp(68)).toFloat()
                               }
                           }
                       }
                       2 -> {
                           // 70 / 30 Split
                           val splitH = (H * 0.68f).toInt()
-                          rearContainer.layoutParams = FrameLayout.LayoutParams(W, splitH, Gravity.TOP or Gravity.START)
-                          frontContainer.layoutParams = FrameLayout.LayoutParams(W, H - splitH, Gravity.TOP or Gravity.START)
-                          frontContainer.clipToOutline = false
-                          frontContainer.background = null
-                          frontContainer.post {
-                              frontContainer.x = 0f
-                              frontContainer.y = splitH.toFloat()
-                          }
+                          primaryContainer.layoutParams = FrameLayout.LayoutParams(W, splitH, Gravity.TOP or Gravity.START)
+                          secondaryContainer.layoutParams = FrameLayout.LayoutParams(W, H - splitH, Gravity.TOP or Gravity.START)
+                          primaryContainer.clipToOutline = false
+                          secondaryContainer.clipToOutline = false
+                          primaryContainer.background = null
+                          secondaryContainer.background = null
+                          primaryContainer.post { primaryContainer.x = 0f; primaryContainer.y = 0f }
+                          secondaryContainer.post { secondaryContainer.x = 0f; secondaryContainer.y = splitH.toFloat() }
                       }
                       3 -> {
-                          // 50 / 50 Top-Bottom Split
+                          // 50 / 50 Split
                           val halfH = H / 2
-                          rearContainer.layoutParams = FrameLayout.LayoutParams(W, halfH, Gravity.TOP or Gravity.START)
-                          frontContainer.layoutParams = FrameLayout.LayoutParams(W, H - halfH, Gravity.TOP or Gravity.START)
-                          frontContainer.clipToOutline = false
-                          frontContainer.background = null
-                          frontContainer.post {
-                              frontContainer.x = 0f
-                              frontContainer.y = halfH.toFloat()
-                          }
+                          primaryContainer.layoutParams = FrameLayout.LayoutParams(W, halfH, Gravity.TOP or Gravity.START)
+                          secondaryContainer.layoutParams = FrameLayout.LayoutParams(W, H - halfH, Gravity.TOP or Gravity.START)
+                          primaryContainer.clipToOutline = false
+                          secondaryContainer.clipToOutline = false
+                          primaryContainer.background = null
+                          secondaryContainer.background = null
+                          primaryContainer.post { primaryContainer.x = 0f; primaryContainer.y = 0f }
+                          secondaryContainer.post { secondaryContainer.x = 0f; secondaryContainer.y = halfH.toFloat() }
                       }
                       4 -> {
-                          // Side-by-Side (Left / Right Split)
+                          // Side-by-Side (Left / Right)
                           val halfW = W / 2
-                          rearContainer.layoutParams = FrameLayout.LayoutParams(halfW, H, Gravity.TOP or Gravity.START)
-                          frontContainer.layoutParams = FrameLayout.LayoutParams(W - halfW, H, Gravity.TOP or Gravity.START)
-                          frontContainer.clipToOutline = false
-                          frontContainer.background = null
-                          frontContainer.post {
-                              frontContainer.x = halfW.toFloat()
-                              frontContainer.y = 0f
-                          }
+                          primaryContainer.layoutParams = FrameLayout.LayoutParams(halfW, H, Gravity.TOP or Gravity.START)
+                          secondaryContainer.layoutParams = FrameLayout.LayoutParams(W - halfW, H, Gravity.TOP or Gravity.START)
+                          primaryContainer.clipToOutline = false
+                          secondaryContainer.clipToOutline = false
+                          primaryContainer.background = null
+                          secondaryContainer.background = null
+                          primaryContainer.post { primaryContainer.x = 0f; primaryContainer.y = 0f }
+                          secondaryContainer.post { secondaryContainer.x = halfW.toFloat(); secondaryContainer.y = 0f }
                       }
                   }
               }
@@ -622,6 +1005,9 @@ jobs:
                               rearCamera = concurrentCamera.cameras.firstOrNull {
                                   it.cameraInfo.lensFacing == CameraSelector.LENS_FACING_BACK
                               } ?: concurrentCamera.cameras.firstOrNull()
+                              frontCamera = concurrentCamera.cameras.firstOrNull {
+                                  it.cameraInfo.lensFacing == CameraSelector.LENS_FACING_FRONT
+                              }
                           } else {
                               val hdrRear = if (extensionsManager.isExtensionAvailable(rearSelector, ExtensionMode.HDR)) {
                                   extensionsManager.getExtensionEnabledCameraSelector(rearSelector, ExtensionMode.HDR)
@@ -632,20 +1018,44 @@ jobs:
                   }, ContextCompat.getMainExecutor(this))
               }
 
-              private fun triggerPixelShutter(shutterView: View) {
-                  // 1. Pixel Haptic Click + Shutter Button Spring Bounce + Shutter Audio
-                  shutterView.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
-                  shutterSound.play(MediaActionSound.SHUTTER_CLICK)
-
-                  shutterView.animate().scaleX(0.86f).scaleY(0.86f).setDuration(75).withEndAction {
-                      shutterView.animate().scaleX(1f).scaleY(1f).setDuration(120).start()
+              private fun triggerPixelShutterSequence(shutterDisc: View) {
+                  shutterDisc.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+                  shutterDisc.animate().scaleX(0.82f).scaleY(0.82f).setDuration(70).withEndAction {
+                      shutterDisc.animate().scaleX(1f).scaleY(1f).setDuration(140).start()
                   }.start()
 
-                  // 2. Pixel Viewfinder Shutter Flash Animation
-                  flashOverlay.alpha = 0.88f
-                  flashOverlay.animate().alpha(0f).setDuration(240).start()
+                  if (timerSeconds <= 0) {
+                      executeImmediateCapture()
+                  } else {
+                      var remaining = timerSeconds
+                      countdownLabel.visibility = View.VISIBLE
+                      countdownLabel.text = remaining.toString()
 
-                  // 3. Composite & Save Photo Matching Exact Active Layout & Position
+                      val tick = object : Runnable {
+                          override fun run() {
+                              remaining -= 1
+                              if (remaining > 0) {
+                                  countdownLabel.text = remaining.toString()
+                                  countdownLabel.scaleX = 1.25f
+                                  countdownLabel.scaleY = 1.25f
+                                  countdownLabel.animate().scaleX(1f).scaleY(1f).setDuration(220).start()
+                                  mainHandler.postDelayed(this, 1000)
+                              } else {
+                                  countdownLabel.visibility = View.GONE
+                                  executeImmediateCapture()
+                              }
+                          }
+                      }
+                      mainHandler.postDelayed(tick, 1000)
+                  }
+              }
+
+              private fun executeImmediateCapture() {
+                  shutterSound.play(MediaActionSound.SHUTTER_CLICK)
+
+                  flashOverlay.alpha = 0.92f
+                  flashOverlay.animate().alpha(0f).setDuration(260).start()
+
                   captureDualCompositeToGallery()
               }
 
@@ -653,35 +1063,44 @@ jobs:
                   val rearBmp = previewRear.bitmap
                   val frontBmp = previewFront.bitmap
                   if (rearBmp == null && frontBmp == null) {
-                      Toast.makeText(this, "Camera preview warming up...", Toast.LENGTH_SHORT).show()
+                      Toast.makeText(this, "Camera sensors warming up...", Toast.LENGTH_SHORT).show()
                       return
                   }
 
-                  val outW = stageLayout.width.takeIf { it > 0 } ?: 1080
-                  val outH = stageLayout.height.takeIf { it > 0 } ?: 1440
+                  val outW = stageCard.width.takeIf { it > 0 } ?: 1080
+                  val outH = stageCard.height.takeIf { it > 0 } ?: 1440
                   val combined = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
                   val canvas = Canvas(combined)
                   canvas.drawColor(Color.BLACK)
-                  val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
 
-                  // Draw Rear Camera in its container bounds
-                  rearBmp?.let { bmp ->
+                  val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+                  if (lookIndex != 0) {
+                      paint.colorFilter = ColorMatrixColorFilter(getSelectedColorMatrix())
+                  }
+
+                  val primaryContainer = if (swapSlots) frontContainer else rearContainer
+                  val secondaryContainer = if (swapSlots) rearContainer else frontContainer
+                  val primaryBmp = if (swapSlots) frontBmp else rearBmp
+                  val secondaryBmp = if (swapSlots) rearBmp else frontBmp
+
+                  // 1. Draw Primary Feed
+                  primaryBmp?.let { bmp ->
                       val dst = RectF(
-                          rearContainer.x,
-                          rearContainer.y,
-                          rearContainer.x + rearContainer.width,
-                          rearContainer.y + rearContainer.height
+                          primaryContainer.x,
+                          primaryContainer.y,
+                          primaryContainer.x + primaryContainer.width,
+                          primaryContainer.y + primaryContainer.height
                       )
                       canvas.drawBitmap(bmp, null, dst, paint)
                   }
 
-                  // Draw Front Camera in its exact container bounds (with Circle or Rounded Card clip if in floating mode!)
-                  frontBmp?.let { bmp ->
-                      val fx = frontContainer.x
-                      val fy = frontContainer.y
-                      val fw = frontContainer.width.toFloat()
-                      val fh = frontContainer.height.toFloat()
-                      val dst = RectF(fx, fy, fx + fw, fy + fh)
+                  // 2. Draw Secondary Feed (with Circle or Rounded Card mask when in Floating Mode)
+                  secondaryBmp?.let { bmp ->
+                      val sx = secondaryContainer.x
+                      val sy = secondaryContainer.y
+                      val sw = secondaryContainer.width.toFloat()
+                      val sh = secondaryContainer.height.toFloat()
+                      val dst = RectF(sx, sy, sx + sw, sy + sh)
 
                       canvas.save()
                       val clipPath = Path()
@@ -689,7 +1108,7 @@ jobs:
                           clipPath.addOval(dst, Path.Direction.CW)
                           canvas.clipPath(clipPath)
                       } else if (layoutMode == 0) {
-                          clipPath.addRoundRect(dst, dp(22).toFloat(), dp(22).toFloat(), Path.Direction.CW)
+                          clipPath.addRoundRect(dst, dp(24).toFloat(), dp(24).toFloat(), Path.Direction.CW)
                           canvas.clipPath(clipPath)
                       }
                       canvas.drawBitmap(bmp, null, dst, paint)
@@ -704,19 +1123,22 @@ jobs:
                           if (layoutMode == 1) {
                               canvas.drawOval(dst, borderPaint)
                           } else {
-                              canvas.drawRoundRect(dst, dp(22).toFloat(), dp(22).toFloat(), borderPaint)
+                              canvas.drawRoundRect(dst, dp(24).toFloat(), dp(24).toFloat(), borderPaint)
                           }
                       }
                   }
 
-                  // Update Bottom-Left Gallery Thumbnail with Pixel Pop-In Animation
+                  // Update Bottom-Left Gallery Well with Pixel Spring Pop-In Animation
+                  captureCount += 1
+                  photoCountBadge.text = captureCount.toString()
+                  photoCountBadge.visibility = View.VISIBLE
                   thumbView.setImageBitmap(combined)
-                  thumbView.scaleX = 0.3f
-                  thumbView.scaleY = 0.3f
-                  thumbView.animate().scaleX(1f).scaleY(1f).setDuration(260).start()
+                  thumbView.scaleX = 0.25f
+                  thumbView.scaleY = 0.25f
+                  thumbView.animate().scaleX(1f).scaleY(1f).setDuration(280).start()
 
                   val values = ContentValues().apply {
-                      put(MediaStore.Images.Media.DISPLAY_NAME, "Pixel11_DualSight_" + System.currentTimeMillis() + ".png")
+                      put(MediaStore.Images.Media.DISPLAY_NAME, "Pixel11Pro_DualSight_" + System.currentTimeMillis() + ".png")
                       put(MediaStore.Images.Media.MIME_TYPE, "image/png")
                       put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Pixel11DualSight")
                   }
@@ -726,13 +1148,32 @@ jobs:
                       contentResolver.openOutputStream(uri)?.use { out ->
                           combined.compress(Bitmap.CompressFormat.PNG, 100, out)
                       }
-                      Toast.makeText(this, "Saved! Tap bottom-left thumbnail to open.", Toast.LENGTH_SHORT).show()
+                      Toast.makeText(this, "Saved (${lookLabels[lookIndex]}) • Tap thumbnail to view", Toast.LENGTH_SHORT).show()
                   }
               }
 
               override fun onDestroy() {
                   super.onDestroy()
                   shutterSound.release()
+              }
+
+              // Custom 3x3 Rule-of-Thirds Grid View
+              private class GridOverlayView(context: Context) : View(context) {
+                  private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                      color = Color.parseColor("#44FFFFFF")
+                      strokeWidth = 2f
+                      style = Paint.Style.STROKE
+                  }
+
+                  override fun onDraw(canvas: Canvas) {
+                      super.onDraw(canvas)
+                      val w = width.toFloat()
+                      val h = height.toFloat()
+                      canvas.drawLine(w / 3f, 0f, w / 3f, h, linePaint)
+                      canvas.drawLine(w * 2f / 3f, 0f, w * 2f / 3f, h, linePaint)
+                      canvas.drawLine(0f, h / 3f, w, h / 3f, linePaint)
+                      canvas.drawLine(0f, h * 2f / 3f, w, h * 2f / 3f, linePaint)
+                  }
               }
           }
           EOF
