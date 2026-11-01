@@ -123,6 +123,7 @@ jobs:
           package com.pixel11.dualsight
 
           import android.Manifest
+          import android.annotation.SuppressLint
           import android.content.ContentValues
           import android.content.Context
           import android.content.Intent
@@ -139,6 +140,8 @@ jobs:
           import android.graphics.RenderEffect
           import android.graphics.Typeface
           import android.graphics.drawable.GradientDrawable
+          import android.hardware.camera2.CameraCharacteristics
+          import android.hardware.camera2.CaptureRequest
           import android.media.MediaActionSound
           import android.net.Uri
           import android.os.Build
@@ -146,6 +149,7 @@ jobs:
           import android.os.Handler
           import android.os.Looper
           import android.provider.MediaStore
+          import android.util.Range
           import android.util.TypedValue
           import android.view.Gravity
           import android.view.HapticFeedbackConstants
@@ -161,7 +165,11 @@ jobs:
           import android.widget.Toast
           import androidx.activity.result.contract.ActivityResultContracts
           import androidx.appcompat.app.AppCompatActivity
+          import androidx.camera.camera2.interop.Camera2CameraInfo
+          import androidx.camera.camera2.interop.Camera2Interop
+          import androidx.camera.camera2.interop.ExperimentalCamera2Interop
           import androidx.camera.core.Camera
+          import androidx.camera.core.CameraInfo
           import androidx.camera.core.CameraSelector
           import androidx.camera.core.ConcurrentCamera.SingleCameraConfig
           import androidx.camera.core.FocusMeteringAction
@@ -172,9 +180,12 @@ jobs:
           import androidx.camera.lifecycle.ProcessCameraProvider
           import androidx.camera.view.PreviewView
           import androidx.core.content.ContextCompat
+          import java.util.concurrent.Executors
+          import java.util.concurrent.TimeUnit
           import kotlin.math.abs
           import kotlin.math.min
 
+          @OptIn(ExperimentalCamera2Interop::class)
           class MainActivity : AppCompatActivity() {
 
               private lateinit var stageCard: FrameLayout
@@ -183,11 +194,12 @@ jobs:
               private lateinit var previewRear: PreviewView
               private lateinit var previewFront: PreviewView
               private lateinit var gridOverlayView: GridOverlayView
-              private lateinit var focusRingView: View
+              private lateinit var focusRingView: FrameLayout
               private lateinit var flashOverlay: View
               private lateinit var countdownLabel: TextView
               private lateinit var thumbView: ImageView
               private lateinit var photoCountBadge: TextView
+              private lateinit var rearSensorBadge: TextView
               private lateinit var zoomTextBadge: TextView
               private lateinit var btnPipSizeChip: TextView
               private lateinit var btnFlashChip: TextView
@@ -198,8 +210,18 @@ jobs:
               private val layoutChips = mutableListOf<TextView>()
               private val lookChips = mutableListOf<TextView>()
 
+              // Cached camera objects for snappy instant switching
+              private var cachedProvider: ProcessCameraProvider? = null
+              private var cachedExtensions: ExtensionsManager? = null
               private var rearCamera: Camera? = null
               private var frontCamera: Camera? = null
+
+              // Discovered Pixel 11 Pro XL Triple Rear Camera Selectors (Ultra-Wide, Main Wide, 5x Telephoto)
+              private var ultraWideSelector: CameraSelector? = null
+              private var mainWideSelector: CameraSelector? = null
+              private var telephotoSelector: CameraSelector? = null
+              private var activeRearLensRole: String = "WIDE"
+
               private var currentZoom = 1.0f
               private var swapSlots = false
               private var torchEnabled = false
@@ -207,15 +229,17 @@ jobs:
               private var timerSeconds = 0
               private var captureCount = 0
               private var lastSavedUri: Uri? = null
+
               private val shutterSound = MediaActionSound()
               private val mainHandler = Handler(Looper.getMainLooper())
+              private val ioExecutor = Executors.newSingleThreadExecutor()
 
-              // 0 = PiP Floating Card, 1 = Circle Bubble, 2 = 70/30 Split, 3 = 50/50 Split, 4 = Left/Right Split
+              // 0 = PiP Floating Card, 1 = Circle Bubble, 2 = 70/30 Split, 3 = 50/50 Split, 4 = Side-by-Side
               private var layoutMode = 0
               private val layoutLabels = listOf("PiP Card", "Circle Bubble", "70/30 Split", "50/50 Split", "Side-by-Side")
               private var pipScale = 1.0f // 0.78f (S), 1.0f (M), 1.28f (L)
 
-              // Color Look Filters (0 = Natural, 1 = Vivid Pop, 2 = Golden Hour, 3 = Cyber Teal, 4 = Leica Mono, 5 = Vintage Film)
+              // Color Look Filters (0 = Natural, 1 = Vivid Pop, 2 = Golden Hour, 3 = Cyber Teal, 4 = Leica Mono, 5 = Vintage)
               private var lookIndex = 0
               private val lookLabels = listOf("Natural", "Vivid Pop", "Golden Hour", "Cyber Teal", "Leica Mono", "Vintage")
 
@@ -227,7 +251,7 @@ jobs:
               private val permissionLauncher = registerForActivityResult(
                   ActivityResultContracts.RequestPermission()
               ) { granted ->
-                  if (granted) startDualConcurrentCamera()
+                  if (granted) initCameraSystem()
                   else Toast.makeText(this, "Camera permission is required", Toast.LENGTH_LONG).show()
               }
 
@@ -259,6 +283,7 @@ jobs:
                   window.statusBarColor = Color.parseColor("#07080C")
                   window.navigationBarColor = Color.parseColor("#07080C")
                   shutterSound.load(MediaActionSound.SHUTTER_CLICK)
+                  shutterSound.load(MediaActionSound.FOCUS_COMPLETE)
 
                   val root = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
@@ -275,7 +300,7 @@ jobs:
                   }
 
                   val brandTitle = TextView(this).apply {
-                      text = "PIXEL PRO • DUAL"
+                      text = "PIXEL 11 PRO XL"
                       setTextColor(Color.WHITE)
                       textSize = 11.5f
                       typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
@@ -366,26 +391,30 @@ jobs:
                   }
                   stageCard.addView(gridOverlayView, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
 
-                  // Tap-to-Focus Ring Indicator
-                  focusRingView = View(this).apply {
-                      background = circleDrawable("#00000000", "#FACC15", 2)
+                  // Pixel Tap-to-Focus Ring + Center AF Dot
+                  focusRingView = FrameLayout(this).apply {
+                      background = circleDrawable("#14FACC15", "#FACC15", 2)
                       alpha = 0f
+                      val centerDot = View(this@MainActivity).apply {
+                          background = circleDrawable("#FDE047")
+                      }
+                      addView(centerDot, FrameLayout.LayoutParams(dp(8), dp(8), Gravity.CENTER))
                   }
-                  stageCard.addView(focusRingView, FrameLayout.LayoutParams(dp(64), dp(64)))
+                  stageCard.addView(focusRingView, FrameLayout.LayoutParams(dp(68), dp(68)))
 
-                  // Top-Left & Top-Right Live Sensor Pills inside Viewfinder
+                  // Top-Left & Top-Right Live Triple-Camera Telemetry Pills inside Viewfinder
                   val lensBadgesRow = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
                       gravity = Gravity.CENTER_VERTICAL
                       setPadding(dp(14), dp(12), dp(14), dp(8))
                   }
 
-                  val rearBadge = TextView(this).apply {
-                      text = "● REAR 50MP HDR"
+                  rearSensorBadge = TextView(this).apply {
+                      text = "● 1x WIDE 50MP • AF-C"
                       setTextColor(Color.parseColor("#A7F3D0"))
                       textSize = 10.5f
                       typeface = Typeface.MONOSPACE
-                      background = pillDrawable("#99090A0F", 14, "#33FFFFFF", 1)
+                      background = pillDrawable("#A6090A0F", 14, "#33FFFFFF", 1)
                       setPadding(dp(10), dp(4), dp(10), dp(4))
                   }
 
@@ -394,37 +423,37 @@ jobs:
                       setTextColor(Color.parseColor("#FDE047"))
                       textSize = 11.5f
                       typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
-                      background = pillDrawable("#99090A0F", 14, "#44FDE047", 1)
+                      background = pillDrawable("#A6090A0F", 14, "#44FDE047", 1)
                       setPadding(dp(10), dp(4), dp(10), dp(4))
                   }
 
-                  lensBadgesRow.addView(rearBadge)
+                  lensBadgesRow.addView(rearSensorBadge)
                   lensBadgesRow.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
                   lensBadgesRow.addView(zoomTextBadge)
                   stageCard.addView(lensBadgesRow, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP))
 
-                  // Pixel Flagship Floating Zoom Pill Dock (.6x, 1x, 2x, 5x, 10x)
+                  // Pixel 11 Pro XL Triple-Camera Zoom Pill Dock (0.5x, 1x, 2x, 5x, 10x)
                   val zoomDock = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
                       gravity = Gravity.CENTER
-                      background = pillDrawable("#B80D0F17", 28, "#33FFFFFF", 1)
+                      background = pillDrawable("#C40D0F17", 28, "#38FFFFFF", 1)
                       setPadding(dp(6), dp(5), dp(6), dp(5))
                   }
 
-                  val presets = listOf(0.6f to ".6", 1.0f to "1x", 2.0f to "2x", 5.0f to "5x", 10.0f to "10x")
+                  val presets = listOf(0.5f to "0.5x", 1.0f to "1x", 2.0f to "2x", 5.0f to "5x", 10.0f to "10x")
                   for ((zVal, zLabel) in presets) {
                       val pill = TextView(this).apply {
                           text = zLabel
                           gravity = Gravity.CENTER
-                          textSize = 11.5f
+                          textSize = 11f
                           typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
                           setOnClickListener {
                               it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-                              applyZoomRatio(zVal)
+                              applyZoomRatio(zVal, allowLensSwitch = true)
                           }
                       }
                       zoomButtons[zVal] = pill
-                      zoomDock.addView(pill, LinearLayout.LayoutParams(dp(40), dp(34)).apply {
+                      zoomDock.addView(pill, LinearLayout.LayoutParams(dp(44), dp(34)).apply {
                           leftMargin = dp(2)
                           rightMargin = dp(2)
                       })
@@ -465,7 +494,7 @@ jobs:
                       setPadding(dp(12), dp(10), dp(12), dp(12))
                   }
 
-                  // Row A: Color Looks Strip ("Natural", "Vivid Pop", "Golden Hour", "Cyber Teal", "Leica Mono", "Vintage")
+                  // Row A: Color Looks Strip
                   val looksScroll = HorizontalScrollView(this).apply {
                       isHorizontalScrollBarEnabled = false
                   }
@@ -506,7 +535,7 @@ jobs:
                       bottomMargin = dp(8)
                   })
 
-                  // Row B: Front Camera View Layout Strip ("PiP Card", "Circle Bubble", "70/30 Split", "50/50 Split", "Side-by-Side")
+                  // Row B: Front Camera View Layout Strip
                   val layoutsScroll = HorizontalScrollView(this).apply {
                       isHorizontalScrollBarEnabled = false
                   }
@@ -548,7 +577,7 @@ jobs:
                       bottomMargin = dp(10)
                   })
 
-                  // Row C: Flagship Shutter Bar (Gallery Thumbnail Well | Double-Ring Pixel Shutter | Swap Front/Rear Button)
+                  // Row C: Flagship Shutter Bar
                   val shutterRow = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
                       gravity = Gravity.CENTER_VERTICAL
@@ -612,11 +641,6 @@ jobs:
                           it.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
                           swapSlots = !swapSlots
                           applyFrontCameraLayout()
-                          Toast.makeText(
-                              this@MainActivity,
-                              if (swapSlots) "Swapped: Front Main + Rear PiP" else "Swapped: Rear Main + Front PiP",
-                              Toast.LENGTH_SHORT
-                          ).show()
                       }
                   }
 
@@ -640,7 +664,7 @@ jobs:
                   setupTouchGestures()
 
                   if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-                      startDualConcurrentCamera()
+                      initCameraSystem()
                   } else {
                       permissionLauncher.launch(Manifest.permission.CAMERA)
                   }
@@ -692,30 +716,20 @@ jobs:
 
               private fun getSelectedColorMatrix(): ColorMatrix {
                   return when (lookIndex) {
-                      1 -> {
-                          // Vivid Pop: Boosted saturation + contrast punch
-                          ColorMatrix().apply { setSaturation(1.45f) }
-                      }
-                      2 -> {
-                          // Golden Hour: Warm amber/gold highlights
-                          ColorMatrix(floatArrayOf(
-                              1.15f, 0.05f, 0f, 0f, 12f,
-                              0.02f, 1.05f, 0f, 0f, 6f,
-                              0f, 0f, 0.85f, 0f, -8f,
-                              0f, 0f, 0f, 1f, 0f
-                          ))
-                      }
-                      3 -> {
-                          // Cyber Teal: Crisp cinema teal & orange grade
-                          ColorMatrix(floatArrayOf(
-                              1.08f, -0.04f, 0f, 0f, 0f,
-                              0f, 1.08f, 0.06f, 0f, 4f,
-                              -0.05f, 0.08f, 1.18f, 0f, 10f,
-                              0f, 0f, 0f, 1f, 0f
-                          ))
-                      }
+                      1 -> ColorMatrix().apply { setSaturation(1.45f) }
+                      2 -> ColorMatrix(floatArrayOf(
+                          1.15f, 0.05f, 0f, 0f, 12f,
+                          0.02f, 1.05f, 0f, 0f, 6f,
+                          0f, 0f, 0.85f, 0f, -8f,
+                          0f, 0f, 0f, 1f, 0f
+                      ))
+                      3 -> ColorMatrix(floatArrayOf(
+                          1.08f, -0.04f, 0f, 0f, 0f,
+                          0f, 1.08f, 0.06f, 0f, 4f,
+                          -0.05f, 0.08f, 1.18f, 0f, 10f,
+                          0f, 0f, 0f, 1f, 0f
+                      ))
                       4 -> {
-                          // Leica Mono: High-contrast black and white
                           val bw = ColorMatrix().apply { setSaturation(0f) }
                           val contrast = ColorMatrix(floatArrayOf(
                               1.25f, 0f, 0f, 0f, -20f,
@@ -726,15 +740,12 @@ jobs:
                           bw.postConcat(contrast)
                           bw
                       }
-                      5 -> {
-                          // Vintage Film: Classic warm faded film curve
-                          ColorMatrix(floatArrayOf(
-                              0.95f, 0.18f, 0.05f, 0f, 14f,
-                              0.08f, 0.92f, 0.05f, 0f, 10f,
-                              0.04f, 0.08f, 0.78f, 0f, 18f,
-                              0f, 0f, 0f, 1f, 0f
-                          ))
-                      }
+                      5 -> ColorMatrix(floatArrayOf(
+                          0.95f, 0.18f, 0.05f, 0f, 14f,
+                          0.08f, 0.92f, 0.05f, 0f, 10f,
+                          0.04f, 0.08f, 0.78f, 0f, 18f,
+                          0f, 0f, 0f, 1f, 0f
+                      ))
                       else -> ColorMatrix()
                   }
               }
@@ -753,11 +764,12 @@ jobs:
                   }
               }
 
+              @SuppressLint("ClickableViewAccessibility")
               private fun setupTouchGestures() {
                   val scaleDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
                       override fun onScale(detector: ScaleGestureDetector): Boolean {
-                          val nextZoom = (currentZoom * detector.scaleFactor).coerceIn(0.6f, 10.0f)
-                          applyZoomRatio(nextZoom)
+                          val nextZoom = (currentZoom * detector.scaleFactor).coerceIn(0.5f, 10.0f)
+                          applyZoomRatio(nextZoom, allowLensSwitch = false)
                           return true
                       }
                   })
@@ -765,7 +777,7 @@ jobs:
                   stageCard.setOnTouchListener { _, event ->
                       scaleDetector.onTouchEvent(event)
                       if (!scaleDetector.isInProgress && event.actionMasked == MotionEvent.ACTION_UP) {
-                          showTapFocusRing(event.x, event.y)
+                          triggerTapToFocus(event.x, event.y)
                       }
                       true
                   }
@@ -797,7 +809,12 @@ jobs:
                                   hasCustomPipPos = true
                                   true
                               }
-                              MotionEvent.ACTION_UP -> moved
+                              MotionEvent.ACTION_UP -> {
+                                  if (!moved) {
+                                      triggerTapToFocus(v.x + event.x, v.y + event.y)
+                                  }
+                                  true
+                              }
                               else -> false
                           }
                       }
@@ -806,55 +823,140 @@ jobs:
                   attachDrag(rearContainer)
               }
 
-              private fun showTapFocusRing(x: Float, y: Float) {
+              private fun triggerTapToFocus(x: Float, y: Float) {
+                  stageCard.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
                   focusRingView.x = x - focusRingView.width / 2f
                   focusRingView.y = y - focusRingView.height / 2f
-                  focusRingView.scaleX = 1.35f
-                  focusRingView.scaleY = 1.35f
+                  focusRingView.scaleX = 1.4f
+                  focusRingView.scaleY = 1.4f
                   focusRingView.alpha = 1f
                   focusRingView.animate()
                       .scaleX(1f)
                       .scaleY(1f)
-                      .setDuration(180)
+                      .setDuration(140)
                       .withEndAction {
-                          focusRingView.animate().alpha(0f).setStartDelay(550).setDuration(250).start()
+                          focusRingView.animate().alpha(0f).setStartDelay(650).setDuration(220).start()
                       }
                       .start()
 
+                  updateTelemetryBadge("AF LOCKING...")
+
                   try {
                       val point = previewRear.meteringPointFactory.createPoint(x, y)
-                      val action = FocusMeteringAction.Builder(point).build()
-                      rearCamera?.cameraControl?.startFocusAndMetering(action)
-                  } catch (_: Exception) {}
+                      val action = FocusMeteringAction.Builder(
+                          point,
+                          FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE or FocusMeteringAction.FLAG_AWB
+                      ).setAutoCancelDuration(3, TimeUnit.SECONDS).build()
+
+                      val future = rearCamera?.cameraControl?.startFocusAndMetering(action)
+                      future?.addListener({
+                          try {
+                              val result = future.get()
+                              if (result != null && result.isFocusSuccessful) {
+                                  updateTelemetryBadge("AF LOCKED ✓")
+                              } else {
+                                  updateTelemetryBadge("AF-C")
+                              }
+                          } catch (_: Exception) {
+                              updateTelemetryBadge("AF-C")
+                          }
+                      }, ContextCompat.getMainExecutor(this))
+
+                      val fPoint = previewFront.meteringPointFactory.createPoint(x, y)
+                      val fAction = FocusMeteringAction.Builder(fPoint, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE).build()
+                      frontCamera?.cameraControl?.startFocusAndMetering(fAction)
+                  } catch (_: Exception) {
+                      updateTelemetryBadge("AF-C")
+                  }
               }
 
-              private fun applyZoomRatio(targetZoom: Float) {
+              private fun updateTelemetryBadge(afStatus: String = "AF-C") {
+                  val lensTag = when {
+                      currentZoom < 0.95f -> "0.5x UW 48MP"
+                      currentZoom >= 9.5f -> "10x SUPER RES"
+                      currentZoom >= 4.8f -> "5x TELE 48MP"
+                      currentZoom >= 1.95f -> "2x CROP 50MP"
+                      else -> "1x WIDE 50MP"
+                  }
+                  rearSensorBadge.text = "● $lensTag • $afStatus"
+              }
+
+              // Discover Pixel 11 Pro XL's Triple Rear Camera Array (Ultra-Wide, Main Wide, 5x Telephoto)
+              private fun discoverPixelTripleCameras(provider: ProcessCameraProvider) {
+                  val backCameras = provider.availableCameraInfos.filter {
+                      it.lensFacing == CameraSelector.LENS_FACING_BACK
+                  }
+                  if (backCameras.isEmpty()) return
+
+                  var minFocal = Float.MAX_VALUE
+                  var maxFocal = Float.MIN_VALUE
+
+                  for (info in backCameras) {
+                      val c2 = Camera2CameraInfo.from(info)
+                      val focals = c2.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+                      val focal = focals?.firstOrNull() ?: 4.5f
+                      if (focal < minFocal) {
+                          minFocal = focal
+                          ultraWideSelector = info.cameraSelector
+                      }
+                      if (focal > maxFocal) {
+                          maxFocal = focal
+                          telephotoSelector = info.cameraSelector
+                      }
+                  }
+                  mainWideSelector = backCameras.first().cameraSelector
+              }
+
+              private fun applyZoomRatio(targetZoom: Float, allowLensSwitch: Boolean) {
                   currentZoom = targetZoom
-                  zoomTextBadge.text = String.format("%.1fx", currentZoom)
+                  zoomTextBadge.text = if (currentZoom < 1f) String.format("%.1fx", currentZoom) else String.format("%.1fx", currentZoom)
                   updateZoomButtonsUI()
+                  updateTelemetryBadge("AF-C")
 
                   val cam = rearCamera
                   if (cam != null) {
                       val zoomState = cam.cameraInfo.zoomState.value
                       val minZ = zoomState?.minZoomRatio ?: 1.0f
                       val maxZ = zoomState?.maxZoomRatio ?: 1.0f
+
+                      // If logical camera natively supports 0.5x..10x (Pixel logical multi-camera), use hardware setZoomRatio directly!
+                      if (targetZoom >= minZ && targetZoom <= maxZ) {
+                          cam.cameraControl.setZoomRatio(targetZoom)
+                          previewRear.scaleX = 1.0f
+                          previewRear.scaleY = 1.0f
+                          return
+                      }
+
+                      // If hardware minZoomRatio > 0.5f (e.g. during concurrent mode) and user tapped 0.5x or 5x,
+                      // switch physical rear camera selector if available!
+                      val desiredRole = when {
+                          targetZoom < 0.9f && ultraWideSelector != null -> "UW"
+                          targetZoom >= 4.8f && telephotoSelector != null -> "TELE"
+                          else -> "WIDE"
+                      }
+                      if (allowLensSwitch && desiredRole != activeRearLensRole && cachedProvider != null) {
+                          activeRearLensRole = desiredRole
+                          bindCamerasFast()
+                          return
+                      }
+
                       if (maxZ > minZ) {
                           val hwZoom = targetZoom.coerceIn(minZ, maxZ)
                           cam.cameraControl.setZoomRatio(hwZoom)
-                          val extraScale = (targetZoom / hwZoom).coerceAtLeast(1.0f)
+                          val extraScale = (targetZoom / hwZoom).coerceIn(0.85f, 4.0f)
                           previewRear.scaleX = extraScale
                           previewRear.scaleY = extraScale
                           return
                       }
                   }
-                  val swScale = targetZoom.coerceAtLeast(1.0f)
+                  val swScale = targetZoom.coerceIn(0.85f, 4.0f)
                   previewRear.scaleX = swScale
                   previewRear.scaleY = swScale
               }
 
               private fun updateZoomButtonsUI() {
                   for ((zVal, pill) in zoomButtons) {
-                      val selected = abs(currentZoom - zVal) < 0.15f
+                      val selected = abs(currentZoom - zVal) < 0.14f
                       if (selected) {
                           pill.setTextColor(Color.BLACK)
                           pill.background = circleDrawable("#FACC15")
@@ -876,7 +978,6 @@ jobs:
                   val primaryContainer = if (swapSlots) frontContainer else rearContainer
                   val secondaryContainer = if (swapSlots) rearContainer else frontContainer
 
-                  // Ensure secondary is drawn above primary in FrameLayout z-order
                   primaryContainer.elevation = dp(1).toFloat()
                   secondaryContainer.elevation = dp(8).toFloat()
 
@@ -884,7 +985,6 @@ jobs:
 
                   when (layoutMode) {
                       0, 1 -> {
-                          // Full Primary + Draggable Floating Card (0) or Circle Bubble (1)
                           primaryContainer.layoutParams = FrameLayout.LayoutParams(W, H, Gravity.TOP or Gravity.START)
                           primaryContainer.clipToOutline = false
                           primaryContainer.background = null
@@ -920,7 +1020,6 @@ jobs:
                           }
                       }
                       2 -> {
-                          // 70 / 30 Split
                           val splitH = (H * 0.68f).toInt()
                           primaryContainer.layoutParams = FrameLayout.LayoutParams(W, splitH, Gravity.TOP or Gravity.START)
                           secondaryContainer.layoutParams = FrameLayout.LayoutParams(W, H - splitH, Gravity.TOP or Gravity.START)
@@ -932,7 +1031,6 @@ jobs:
                           secondaryContainer.post { secondaryContainer.x = 0f; secondaryContainer.y = splitH.toFloat() }
                       }
                       3 -> {
-                          // 50 / 50 Split
                           val halfH = H / 2
                           primaryContainer.layoutParams = FrameLayout.LayoutParams(W, halfH, Gravity.TOP or Gravity.START)
                           secondaryContainer.layoutParams = FrameLayout.LayoutParams(W, H - halfH, Gravity.TOP or Gravity.START)
@@ -944,7 +1042,6 @@ jobs:
                           secondaryContainer.post { secondaryContainer.x = 0f; secondaryContainer.y = halfH.toFloat() }
                       }
                       4 -> {
-                          // Side-by-Side (Left / Right)
                           val halfW = W / 2
                           primaryContainer.layoutParams = FrameLayout.LayoutParams(halfW, H, Gravity.TOP or Gravity.START)
                           secondaryContainer.layoutParams = FrameLayout.LayoutParams(W - halfW, H, Gravity.TOP or Gravity.START)
@@ -958,70 +1055,115 @@ jobs:
                   }
               }
 
-              private fun startDualConcurrentCamera() {
+              private fun buildSnappyPreview(surfaceProvider: Preview.SurfaceProvider): Preview {
+                  val builder = Preview.Builder()
+                  val interop = Camera2Interop.Extender(builder)
+                  interop.setCaptureRequestOption(
+                      CaptureRequest.CONTROL_AF_MODE,
+                      CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+                  )
+                  interop.setCaptureRequestOption(
+                      CaptureRequest.CONTROL_AE_MODE,
+                      CaptureRequest.CONTROL_AE_MODE_ON
+                  )
+                  interop.setCaptureRequestOption(
+                      CaptureRequest.CONTROL_AWB_MODE,
+                      CaptureRequest.CONTROL_AWB_MODE_AUTO
+                  )
+                  interop.setCaptureRequestOption(
+                      CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                      Range(30, 60)
+                  )
+                  return builder.build().also {
+                      it.setSurfaceProvider(surfaceProvider)
+                  }
+              }
+
+              private fun initCameraSystem() {
                   val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
                   cameraProviderFuture.addListener({
-                      val cameraProvider = cameraProviderFuture.get()
-                      val extensionsFuture = ExtensionsManager.getInstanceAsync(this, cameraProvider)
-                      extensionsFuture.addListener({
-                          val extensionsManager = extensionsFuture.get()
-                          cameraProvider.unbindAll()
-
-                          var primaryRearSelector: CameraSelector? = null
-                          var secondaryFrontSelector: CameraSelector? = null
-
-                          for (cameraInfos in cameraProvider.availableConcurrentCameraInfos) {
-                              primaryRearSelector = cameraInfos.firstOrNull {
-                                  it.lensFacing == CameraSelector.LENS_FACING_BACK
-                              }?.cameraSelector
-                              secondaryFrontSelector = cameraInfos.firstOrNull {
-                                  it.lensFacing == CameraSelector.LENS_FACING_FRONT
-                              }?.cameraSelector
-                              if (primaryRearSelector != null && secondaryFrontSelector != null) break
-                          }
-
-                          val rearSelector = primaryRearSelector ?: CameraSelector.DEFAULT_BACK_CAMERA
-                          val frontSelector = secondaryFrontSelector ?: CameraSelector.DEFAULT_FRONT_CAMERA
-
-                          val pRear = Preview.Builder().build().also {
-                              it.setSurfaceProvider(previewRear.surfaceProvider)
-                          }
-                          val pFront = Preview.Builder().build().also {
-                              it.setSurfaceProvider(previewFront.surfaceProvider)
-                          }
-
-                          if (primaryRearSelector != null && secondaryFrontSelector != null) {
-                              val primaryConfig = SingleCameraConfig(
-                                  rearSelector,
-                                  UseCaseGroup.Builder().addUseCase(pRear).build(),
-                                  this
-                              )
-                              val secondaryConfig = SingleCameraConfig(
-                                  frontSelector,
-                                  UseCaseGroup.Builder().addUseCase(pFront).build(),
-                                  this
-                              )
-                              val concurrentCamera = cameraProvider.bindToLifecycle(listOf(primaryConfig, secondaryConfig))
-                              rearCamera = concurrentCamera.cameras.firstOrNull {
-                                  it.cameraInfo.lensFacing == CameraSelector.LENS_FACING_BACK
-                              } ?: concurrentCamera.cameras.firstOrNull()
-                              frontCamera = concurrentCamera.cameras.firstOrNull {
-                                  it.cameraInfo.lensFacing == CameraSelector.LENS_FACING_FRONT
-                              }
-                          } else {
-                              val hdrRear = if (extensionsManager.isExtensionAvailable(rearSelector, ExtensionMode.HDR)) {
-                                  extensionsManager.getExtensionEnabledCameraSelector(rearSelector, ExtensionMode.HDR)
-                              } else rearSelector
-                              rearCamera = cameraProvider.bindToLifecycle(this, hdrRear, pRear)
-                          }
+                      val provider = cameraProviderFuture.get()
+                      cachedProvider = provider
+                      discoverPixelTripleCameras(provider)
+                      val extFuture = ExtensionsManager.getInstanceAsync(this, provider)
+                      extFuture.addListener({
+                          cachedExtensions = extFuture.get()
+                          bindCamerasFast()
                       }, ContextCompat.getMainExecutor(this))
                   }, ContextCompat.getMainExecutor(this))
               }
 
+              private fun bindCamerasFast() {
+                  val cameraProvider = cachedProvider ?: return
+                  val extensionsManager = cachedExtensions
+                  cameraProvider.unbindAll()
+
+                  val preferredRear = when (activeRearLensRole) {
+                      "UW" -> ultraWideSelector
+                      "TELE" -> telephotoSelector
+                      else -> mainWideSelector
+                  }
+
+                  var primaryRearSelector: CameraSelector? = preferredRear
+                  var secondaryFrontSelector: CameraSelector? = null
+
+                  for (cameraInfos in cameraProvider.availableConcurrentCameraInfos) {
+                      if (primaryRearSelector == null) {
+                          primaryRearSelector = cameraInfos.firstOrNull {
+                              it.lensFacing == CameraSelector.LENS_FACING_BACK
+                          }?.cameraSelector
+                      }
+                      secondaryFrontSelector = cameraInfos.firstOrNull {
+                          it.lensFacing == CameraSelector.LENS_FACING_FRONT
+                      }?.cameraSelector
+                      if (primaryRearSelector != null && secondaryFrontSelector != null) break
+                  }
+
+                  val rearSelector = primaryRearSelector ?: CameraSelector.DEFAULT_BACK_CAMERA
+                  val frontSelector = secondaryFrontSelector ?: CameraSelector.DEFAULT_FRONT_CAMERA
+
+                  val pRear = buildSnappyPreview(previewRear.surfaceProvider)
+                  val pFront = buildSnappyPreview(previewFront.surfaceProvider)
+
+                  try {
+                      if (secondaryFrontSelector != null) {
+                          val primaryConfig = SingleCameraConfig(
+                              rearSelector,
+                              UseCaseGroup.Builder().addUseCase(pRear).build(),
+                              this
+                          )
+                          val secondaryConfig = SingleCameraConfig(
+                              frontSelector,
+                              UseCaseGroup.Builder().addUseCase(pFront).build(),
+                              this
+                          )
+                          val concurrentCamera = cameraProvider.bindToLifecycle(listOf(primaryConfig, secondaryConfig))
+                          rearCamera = concurrentCamera.cameras.firstOrNull {
+                              it.cameraInfo.lensFacing == CameraSelector.LENS_FACING_BACK
+                          } ?: concurrentCamera.cameras.firstOrNull()
+                          frontCamera = concurrentCamera.cameras.firstOrNull {
+                              it.cameraInfo.lensFacing == CameraSelector.LENS_FACING_FRONT
+                          }
+                      } else {
+                          val hdrRear = if (extensionsManager != null && extensionsManager.isExtensionAvailable(rearSelector, ExtensionMode.HDR)) {
+                              extensionsManager.getExtensionEnabledCameraSelector(rearSelector, ExtensionMode.HDR)
+                          } else rearSelector
+                          rearCamera = cameraProvider.bindToLifecycle(this, hdrRear, pRear)
+                      }
+                  } catch (_: Exception) {
+                      // Fallback to default concurrent or single camera if physical lens binding conflicts
+                      try {
+                          rearCamera = cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, pRear)
+                      } catch (_: Exception) {}
+                  }
+
+                  applyZoomRatio(currentZoom, allowLensSwitch = false)
+              }
+
               private fun triggerPixelShutterSequence(shutterDisc: View) {
                   shutterDisc.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
-                  shutterDisc.animate().scaleX(0.82f).scaleY(0.82f).setDuration(70).withEndAction {
-                      shutterDisc.animate().scaleX(1f).scaleY(1f).setDuration(140).start()
+                  shutterDisc.animate().scaleX(0.82f).scaleY(0.82f).setDuration(60).withEndAction {
+                      shutterDisc.animate().scaleX(1f).scaleY(1f).setDuration(110).start()
                   }.start()
 
                   if (timerSeconds <= 0) {
@@ -1038,7 +1180,7 @@ jobs:
                                   countdownLabel.text = remaining.toString()
                                   countdownLabel.scaleX = 1.25f
                                   countdownLabel.scaleY = 1.25f
-                                  countdownLabel.animate().scaleX(1f).scaleY(1f).setDuration(220).start()
+                                  countdownLabel.animate().scaleX(1f).scaleY(1f).setDuration(200).start()
                                   mainHandler.postDelayed(this, 1000)
                               } else {
                                   countdownLabel.visibility = View.GONE
@@ -1054,7 +1196,7 @@ jobs:
                   shutterSound.play(MediaActionSound.SHUTTER_CLICK)
 
                   flashOverlay.alpha = 0.92f
-                  flashOverlay.animate().alpha(0f).setDuration(260).start()
+                  flashOverlay.animate().alpha(0f).setDuration(200).start()
 
                   captureDualCompositeToGallery()
               }
@@ -1083,7 +1225,6 @@ jobs:
                   val primaryBmp = if (swapSlots) frontBmp else rearBmp
                   val secondaryBmp = if (swapSlots) rearBmp else frontBmp
 
-                  // 1. Draw Primary Feed
                   primaryBmp?.let { bmp ->
                       val dst = RectF(
                           primaryContainer.x,
@@ -1094,7 +1235,6 @@ jobs:
                       canvas.drawBitmap(bmp, null, dst, paint)
                   }
 
-                  // 2. Draw Secondary Feed (with Circle or Rounded Card mask when in Floating Mode)
                   secondaryBmp?.let { bmp ->
                       val sx = secondaryContainer.x
                       val sy = secondaryContainer.y
@@ -1128,36 +1268,48 @@ jobs:
                       }
                   }
 
-                  // Update Bottom-Left Gallery Well with Pixel Spring Pop-In Animation
+                  // Instant UI Thumbnail Pop-In (Zero main-thread disk lag!)
                   captureCount += 1
                   photoCountBadge.text = captureCount.toString()
                   photoCountBadge.visibility = View.VISIBLE
                   thumbView.setImageBitmap(combined)
                   thumbView.scaleX = 0.25f
                   thumbView.scaleY = 0.25f
-                  thumbView.animate().scaleX(1f).scaleY(1f).setDuration(280).start()
+                  thumbView.animate().scaleX(1f).scaleY(1f).setDuration(220).start()
 
-                  val values = ContentValues().apply {
-                      put(MediaStore.Images.Media.DISPLAY_NAME, "Pixel11Pro_DualSight_" + System.currentTimeMillis() + ".png")
-                      put(MediaStore.Images.Media.MIME_TYPE, "image/png")
-                      put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Pixel11DualSight")
-                  }
-                  val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-                  if (uri != null) {
-                      lastSavedUri = uri
-                      contentResolver.openOutputStream(uri)?.use { out ->
-                          combined.compress(Bitmap.CompressFormat.PNG, 100, out)
+                  val chosenLookLabel = lookLabels[lookIndex]
+                  val chosenZoomLabel = String.format("%.1fx", currentZoom)
+
+                  // Encode & Save to MediaStore asynchronously on background thread for snappy consecutive captures
+                  ioExecutor.execute {
+                      val values = ContentValues().apply {
+                          put(MediaStore.Images.Media.DISPLAY_NAME, "Pixel11Pro_DualSight_" + System.currentTimeMillis() + ".jpg")
+                          put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                          put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Pixel11DualSight")
                       }
-                      Toast.makeText(this, "Saved (${lookLabels[lookIndex]}) • Tap thumbnail to view", Toast.LENGTH_SHORT).show()
+                      val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                      if (uri != null) {
+                          contentResolver.openOutputStream(uri)?.use { out ->
+                              combined.compress(Bitmap.CompressFormat.JPEG, 98, out)
+                          }
+                          mainHandler.post {
+                              lastSavedUri = uri
+                              Toast.makeText(
+                                  this@MainActivity,
+                                  "Saved ($chosenZoomLabel • $chosenLookLabel)",
+                                  Toast.LENGTH_SHORT
+                              ).show()
+                          }
+                      }
                   }
               }
 
               override fun onDestroy() {
                   super.onDestroy()
                   shutterSound.release()
+                  ioExecutor.shutdown()
               }
 
-              // Custom 3x3 Rule-of-Thirds Grid View
               private class GridOverlayView(context: Context) : View(context) {
                   private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                       color = Color.parseColor("#44FFFFFF")
