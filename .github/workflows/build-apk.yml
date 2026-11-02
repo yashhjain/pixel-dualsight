@@ -63,9 +63,9 @@ jobs:
               defaultConfig {
                   applicationId = "com.pixel11.dualsight"
                   minSdk = 30
-                  targetSdk = 35
-                  versionCode = 7
-                  versionName = "7.0.0"
+                  targetSdk = 34
+                  versionCode = 8
+                  versionName = "8.0.0"
               }
               buildTypes {
                   release {
@@ -140,6 +140,7 @@ jobs:
           import android.graphics.Outline
           import android.graphics.Paint
           import android.graphics.Path
+          import android.graphics.Rect
           import android.graphics.RectF
           import android.graphics.RenderEffect
           import android.graphics.SurfaceTexture
@@ -151,6 +152,7 @@ jobs:
           import android.hardware.SensorManager
           import android.hardware.camera2.CameraCharacteristics
           import android.hardware.camera2.CameraManager
+          import android.hardware.camera2.params.StreamConfigurationMap
           import android.media.MediaActionSound
           import android.net.Uri
           import android.os.Build
@@ -159,6 +161,8 @@ jobs:
           import android.os.Looper
           import android.os.SystemClock
           import android.provider.MediaStore
+          import android.util.Range
+          import android.util.Rational
           import android.util.Size
           import android.util.TypedValue
           import android.view.Gravity
@@ -167,6 +171,7 @@ jobs:
           import android.view.ScaleGestureDetector
           import android.view.Surface
           import android.view.View
+          import android.view.ViewGroup
           import android.view.ViewOutlineProvider
           import android.view.WindowManager
           import android.widget.EditText
@@ -1314,7 +1319,7 @@ jobs:
                               polaroidCaptionText.text = "$customCaption ✎"
                           }
                       }
-                      .setNegativeButton("Cancel", null)
+                      .setNegativeButton("Cancel") { dialog, _ -> dialog.dismiss() }
                       .show()
               }
 
@@ -1339,18 +1344,37 @@ jobs:
                   val cam = rearCamera ?: return
                   val expState = cam.cameraInfo.exposureState
                   if (!expState.isExposureCompensationSupported) return
-                  val range = expState.exposureCompensationRange
-                  val targetIdx = stepDelta.coerceIn(range.lower, range.upper)
+                  val range: Range<Int> = expState.exposureCompensationRange
+                  val minIdx: Int = range.lower ?: -6
+                  val maxIdx: Int = range.upper ?: 6
+                  val targetIdx: Int = min(maxIdx, max(minIdx, stepDelta))
                   cam.cameraControl.setExposureCompensationIndex(targetIdx)
-                  val stepVal = expState.exposureCompensationStep.toFloat() * targetIdx
+                  val stepRat: Rational = expState.exposureCompensationStep
+                  val num: Float = stepRat.numerator.toFloat()
+                  val den: Float = max(1f, stepRat.denominator.toFloat())
+                  val stepVal: Float = (num / den) * targetIdx.toFloat()
                   val sign = if (stepVal >= 0f) "+" else ""
-                  evValueLabel.text = String.format("EV %s%.1f", sign, stepVal)
+                  evValueLabel.text = String.format(Locale.US, "EV %s%.1f", sign, stepVal)
+              }
+
+              private fun detachFromParent(v: View) {
+                  (v.parent as? ViewGroup)?.removeView(v)
               }
 
               private fun updateOrientationLayout(orientation: Int) {
                   rootLayout.removeAllViews()
                   bottomDeck.removeAllViews()
                   shutterRowContainer.removeAllViews()
+                  detachFromParent(topHud)
+                  detachFromParent(stageCard)
+                  detachFromParent(zoomCapsuleLayout)
+                  detachFromParent(lensScroll)
+                  detachFromParent(modeStripRow)
+                  detachFromParent(leftControlsGroup)
+                  detachFromParent(shutterOuterRing)
+                  detachFromParent(btnSwapCams)
+                  detachFromParent(shutterRowContainer)
+                  detachFromParent(bottomDeck)
 
                   val isLandscape = (orientation == Configuration.ORIENTATION_LANDSCAPE)
 
@@ -1819,36 +1843,44 @@ jobs:
                               activeRect.width().toLong() * activeRect.height().toLong()
                           } else 0L
 
-                          val streamMap = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-                          val outputSizes = streamMap?.getOutputSizes(SurfaceTexture::class.java) ?: emptyArray()
+                          val streamMap: StreamConfigurationMap? = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                          val rawSizes = streamMap?.getOutputSizes(SurfaceTexture::class.java)
+                          val sizeList = mutableListOf<Size>()
+                          if (rawSizes != null) {
+                              for (sz in rawSizes) {
+                                  if (sz != null) sizeList.add(sz)
+                              }
+                          }
 
-                          if (facing == CameraCharacteristics.LENS_FACING_BACK) {
+                          if (facing != null && facing == CameraCharacteristics.LENS_FACING_BACK) {
                               if (mpCount > maxRearPixels) maxRearPixels = mpCount
 
                               if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                                  val zRange = chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+                                  val zRange: Range<Float>? = chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
                                   if (zRange != null) {
-                                      minZ = min(minZ, zRange.lower)
-                                      maxZ = max(maxZ, zRange.upper)
+                                      val zLow: Float = zRange.lower ?: 1.0f
+                                      val zHigh: Float = zRange.upper ?: 8.0f
+                                      minZ = min(minZ, zLow)
+                                      maxZ = max(maxZ, zHigh)
                                   }
                               } else {
-                                  val digMax = chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 8.0f
+                                  val digMax: Float = chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 8.0f
                                   maxZ = max(maxZ, digMax)
                               }
 
-                              val best16x9 = pickBestResolution(outputSizes, 16f / 9f)
-                              val best4x3 = pickBestResolution(outputSizes, 4f / 3f)
+                              val best16x9 = pickBestResolution(sizeList, 16f / 9f)
+                              val best4x3 = pickBestResolution(sizeList, 4f / 3f)
                               if (best16x9.width * best16x9.height > bestRear16x9Size.width * bestRear16x9Size.height) {
                                   bestRear16x9Size = best16x9
                               }
                               if (best4x3.width * best4x3.height > bestRear4x3Size.width * bestRear4x3Size.height) {
                                   bestRear4x3Size = best4x3
                               }
-                          } else if (facing == CameraCharacteristics.LENS_FACING_FRONT) {
+                          } else if (facing != null && facing == CameraCharacteristics.LENS_FACING_FRONT) {
                               if (mpCount > maxFrontPixels) maxFrontPixels = mpCount
 
-                              val best16x9 = pickBestResolution(outputSizes, 16f / 9f)
-                              val best4x3 = pickBestResolution(outputSizes, 4f / 3f)
+                              val best16x9 = pickBestResolution(sizeList, 16f / 9f)
+                              val best4x3 = pickBestResolution(sizeList, 4f / 3f)
                               if (best16x9.width * best16x9.height > bestFront16x9Size.width * bestFront16x9Size.height) {
                                   bestFront16x9Size = best16x9
                               }
@@ -1916,41 +1948,56 @@ jobs:
                       deviceMinZoom = minZ.coerceIn(0.4f, 1.0f)
                       deviceMaxZoom = maxZ.coerceIn(2.0f, 30.0f)
 
-                      val stops = sortedSetOf<Float>()
+                      val rawStops = mutableListOf<Float>()
                       if (deviceMinZoom < 0.92f) {
-                          stops.add((deviceMinZoom * 10f).roundToInt() / 10f)
+                          rawStops.add((deviceMinZoom * 10f).roundToInt() / 10f)
                       }
-                      stops.add(1.0f)
-                      if (deviceMaxZoom >= 2.0f) stops.add(2.0f)
+                      rawStops.add(1.0f)
+                      if (deviceMaxZoom >= 2.0f) rawStops.add(2.0f)
                       for (lens in discoveredRearLenses) {
                           if (lens.targetZoom > 1.4f && lens.targetZoom <= deviceMaxZoom) {
-                              stops.add(lens.targetZoom)
+                              rawStops.add(lens.targetZoom)
                           }
                       }
-                      if (stops.none { it > 2.5f } && deviceMaxZoom >= 4.0f) {
-                          stops.add(min(5.0f, deviceMaxZoom))
+                      if (rawStops.none { it > 2.5f } && deviceMaxZoom >= 4.0f) {
+                          rawStops.add(min(5.0f, deviceMaxZoom))
                       }
                       val topPreset = when {
                           deviceMaxZoom >= 10.0f -> 10.0f
                           deviceMaxZoom >= 8.0f -> 8.0f
                           else -> (deviceMaxZoom * 10f).roundToInt() / 10f
                       }
-                      if (topPreset > 2.0f) stops.add(topPreset)
+                      if (topPreset > 2.0f) rawStops.add(topPreset)
 
-                      dynamicZoomStops = stops.toList().take(6)
+                      val uniqueStops = mutableListOf<Float>()
+                      for (s in rawStops.sorted()) {
+                          if (uniqueStops.none { abs(it - s) < 0.08f }) {
+                              uniqueStops.add(s)
+                          }
+                      }
+                      dynamicZoomStops = uniqueStops.take(6)
                       rebuildDynamicZoomAndLensUI()
                   } catch (ignored: Exception) {
                   }
               }
 
-              private fun pickBestResolution(sizes: Array<Size>, targetAspect: Float): Size {
+              private fun pickBestResolution(sizes: List<Size>, targetAspect: Float): Size {
                   if (sizes.isEmpty()) return Size(1920, 1080)
                   val matchingAspect = sizes.filter { s ->
                       val ratio = s.width.toFloat() / s.height.toFloat().coerceAtLeast(1f)
                       abs(ratio - targetAspect) < 0.12f
                   }
-                  val pool = if (matchingAspect.isNotEmpty()) matchingAspect else sizes.toList()
-                  return pool.maxByOrNull { it.width.toLong() * it.height.toLong() } ?: Size(1920, 1080)
+                  val pool = if (matchingAspect.isNotEmpty()) matchingAspect else sizes
+                  var best = Size(1920, 1080)
+                  var bestPx = 0L
+                  for (s in pool) {
+                      val px = s.width.toLong() * s.height.toLong()
+                      if (px > bestPx) {
+                          bestPx = px
+                          best = s
+                      }
+                  }
+                  return best
               }
 
               private fun switchPhysicalRearLens(lens: DiscoveredLens) {
@@ -2382,13 +2429,18 @@ jobs:
 
               private fun captureBurstQuadToGallery(firstRear: Bitmap?, firstFront: Bitmap?) {
                   val frames = mutableListOf<Bitmap>()
-                  val snapSingle = { r: Bitmap?, f: Bitmap? ->
+                  val burstPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+                  val snapSingle: (Bitmap?, Bitmap?) -> Bitmap = { r, f ->
                       val w = 720
                       val h = 960
                       val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
                       val c = Canvas(b)
-                      r?.let { c.drawBitmap(it, null, RectF(0f, 0f, w.toFloat(), h / 2f), null) }
-                      f?.let { c.drawBitmap(it, null, RectF(0f, h / 2f, w.toFloat(), h.toFloat()), null) }
+                      if (r != null) {
+                          c.drawBitmap(r, null, RectF(0f, 0f, w.toFloat(), h / 2f), burstPaint)
+                      }
+                      if (f != null) {
+                          c.drawBitmap(f, null, RectF(0f, h / 2f, w.toFloat(), h.toFloat()), burstPaint)
+                      }
                       b
                   }
                   frames.add(snapSingle(firstRear, firstFront))
@@ -2412,7 +2464,7 @@ jobs:
                                   RectF(735f, 975f, 1450f, 1930f)
                               )
                               for (i in 0 until min(4, frames.size)) {
-                                  gc.drawBitmap(frames[i], null, coords[i], null)
+                                  gc.drawBitmap(frames[i], null, coords[i], burstPaint)
                               }
                               lastCapturedBitmap = gridBmp
                               thumbView.setImageBitmap(gridBmp)
@@ -2598,7 +2650,10 @@ jobs:
                       }
                       y += stepY
                   }
-                  val maxBin = (bins.maxOrNull() ?: 1).coerceAtLeast(1)
+                  var maxBin = 1
+                  for (bVal in bins) {
+                      if (bVal > maxBin) maxBin = bVal
+                  }
                   return FloatArray(32) { i -> bins[i].toFloat() / maxBin.toFloat() }
               }
 
@@ -2735,6 +2790,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "v7.0.${{ github.run_number }}" Pixel11-DualSight.apk \
+          gh release create "v8.0.${{ github.run_number }}" Pixel11-DualSight.apk \
             --title "Dual Sight Pro APK (Build #${{ github.run_number }})" \
             --notes "Tap **Pixel11-DualSight.apk** under Assets below to download and install directly on your Android device."
