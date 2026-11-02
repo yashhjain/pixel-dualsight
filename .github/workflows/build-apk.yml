@@ -355,15 +355,15 @@ jobs:
                       }
                   }
 
-                  // 4K Pro Max-Res Toggle (unlocks uncompressed 4K/QHD+ ISP stream without Android concurrent HAL downscaling)
+                  // 4K+ Dual Max-Res Toggle (keeps BOTH Rear & Front cameras live using full-sensor 4:3 High-Resolution strategy + Ultra-HD 4K output)
                   btnMaxResChip = buildIconCircleChip("4K+") {
                       proMaxResMode = !proMaxResMode
                       btnMaxResChip.background = if (proMaxResMode) circleDrawable("#FACC15") else circleDrawable("#2E3446", "#33FFFFFF", 1)
                       btnMaxResChip.setTextColor(if (proMaxResMode) Color.BLACK else Color.WHITE)
                       Toast.makeText(
                           this@MainActivity,
-                          if (proMaxResMode) "4K Max-Res ISP Mode: Uncapped QHD+ streams + Smart Dual-Snap"
-                          else "Concurrent Live Dual Stream Mode",
+                          if (proMaxResMode) "4K+ Dual Max-Res Active (Both Rear & Front Live)"
+                          else "Standard Dual Stream Active",
                           Toast.LENGTH_SHORT
                       ).show()
                       bindDualCamerasSafely()
@@ -726,11 +726,14 @@ jobs:
                       bottomMargin = dp(12)
                   })
 
-                  // ROW 3: MAIN SHUTTER ROW (Gallery Thumbnail Well | Circular "AF" Button | Double-Ring Pixel Shutter | "Swap" Pill)
-                  val shutterRow = LinearLayout(this).apply {
+                  // ROW 3: MAIN SHUTTER ROW (FrameLayout locks Double-Ring Shutter to exact horizontal center!)
+                  val shutterRow = FrameLayout(this).apply {
+                      setPadding(dp(12), dp(2), dp(12), dp(4))
+                  }
+
+                  val leftControlsGroup = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
                       gravity = Gravity.CENTER_VERTICAL
-                      setPadding(dp(12), dp(2), dp(12), dp(4))
                   }
 
                   val galleryWellFrame = FrameLayout(this)
@@ -761,13 +764,13 @@ jobs:
                       background = circleDrawable("#2563EB", "#07080C", 2)
                       visibility = View.GONE
                   }
-                  galleryWellFrame.addView(thumbView, FrameLayout.LayoutParams(dp(52), dp(52), Gravity.CENTER))
+                  galleryWellFrame.addView(thumbView, FrameLayout.LayoutParams(dp(50), dp(50), Gravity.CENTER))
                   galleryWellFrame.addView(photoCountBadge, FrameLayout.LayoutParams(dp(20), dp(20), Gravity.TOP or Gravity.END))
 
                   // Circular "AF" Button (Left-Center)
                   val btnAfFocus = TextView(this).apply {
                       text = "AF"
-                      textSize = 12.5f
+                      textSize = 12f
                       setTextColor(Color.WHITE)
                       gravity = Gravity.CENTER
                       typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
@@ -777,7 +780,12 @@ jobs:
                       }
                   }
 
-                  // Flagship Double-Ring Pixel Shutter Button (Center)
+                  leftControlsGroup.addView(galleryWellFrame, LinearLayout.LayoutParams(dp(54), dp(54)))
+                  leftControlsGroup.addView(btnAfFocus, LinearLayout.LayoutParams(dp(46), dp(46)).apply {
+                      leftMargin = dp(10)
+                  })
+
+                  // Flagship Double-Ring Pixel Shutter Button (Locked to exact Gravity.CENTER of shutterRow!)
                   val shutterOuterRing = FrameLayout(this).apply {
                       background = circleDrawable("#00000000", "#FFFFFF", 3)
                       setPadding(dp(5), dp(5), dp(5), dp(5))
@@ -790,7 +798,7 @@ jobs:
                       triggerPixelShutterSequence(shutterInnerDisc)
                   }
 
-                  // "Swap" Pill Button (Right)
+                  // "Swap" Pill Button (Locked to Gravity.END | Gravity.CENTER_VERTICAL)
                   val btnSwapCams = TextView(this).apply {
                       text = "Swap"
                       textSize = 13f
@@ -805,13 +813,9 @@ jobs:
                       }
                   }
 
-                  shutterRow.addView(galleryWellFrame, LinearLayout.LayoutParams(dp(56), dp(56)))
-                  shutterRow.addView(View(this), LinearLayout.LayoutParams(dp(14), 1))
-                  shutterRow.addView(btnAfFocus, LinearLayout.LayoutParams(dp(50), dp(50)))
-                  shutterRow.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
-                  shutterRow.addView(shutterOuterRing, LinearLayout.LayoutParams(dp(76), dp(76)))
-                  shutterRow.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
-                  shutterRow.addView(btnSwapCams, LinearLayout.LayoutParams(dp(84), dp(48)))
+                  shutterRow.addView(leftControlsGroup, FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.START or Gravity.CENTER_VERTICAL))
+                  shutterRow.addView(shutterOuterRing, FrameLayout.LayoutParams(dp(76), dp(76), Gravity.CENTER))
+                  shutterRow.addView(btnSwapCams, FrameLayout.LayoutParams(dp(84), dp(48), Gravity.END or Gravity.CENTER_VERTICAL))
 
                   bottomDeck.addView(shutterRow, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
                   root.addView(bottomDeck, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
@@ -1289,13 +1293,20 @@ jobs:
                   }
               }
 
-              // Build high-resolution Preview streams using CameraX ResolutionSelector (unlocks QHD+/4K on both Rear & Front!)
+              // Build high-resolution Preview streams using CameraX ResolutionSelector on both Rear & Front
               private fun buildHighResPreview(surfaceProvider: Preview.SurfaceProvider, preferBurstMax: Boolean, isFront: Boolean): Preview {
+                  val aspectStrategy = if (proMaxResMode) {
+                      // 50MP Rear & 42MP Front sensors on Pixel 11 Pro XL are native 4:3 full-sensor readout
+                      AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY
+                  } else {
+                      AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY
+                  }
+                  val targetSize = if (proMaxResMode) Size(4000, 3000) else Size(3840, 2160)
                   val resBuilder = ResolutionSelector.Builder()
-                      .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
+                      .setAspectRatioStrategy(aspectStrategy)
                       .setResolutionStrategy(
                           ResolutionStrategy(
-                              Size(3840, 2160),
+                              targetSize,
                               ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
                           )
                       )
@@ -1339,24 +1350,7 @@ jobs:
                           else -> logicalBackSelector
                       }
 
-                      // If user enabled "4K+ Max-Res ISP Mode", bind single active sensor with uncapped 4K/HDR Extensions
-                      // so Android's concurrent HAL never throttles preview resolution!
-                      if (proMaxResMode) {
-                          val pRearMax = buildHighResPreview(previewRear.surfaceProvider, preferBurstMax = true, isFront = false)
-                          val extMgr = cachedExtensions
-                          val selectorWithHdr = if (extMgr != null && extMgr.isExtensionAvailable(targetRearSelector, ExtensionMode.HDR)) {
-                              extMgr.getExtensionEnabledCameraSelector(targetRearSelector, ExtensionMode.HDR)
-                          } else targetRearSelector
-
-                          rearCamera = cameraProvider.bindToLifecycle(this, selectorWithHdr, pRearMax)
-                          frontCamera = null
-
-                          mainHandler.postDelayed({
-                              setZoomSmooth(currentZoom, fromPresetButton = false)
-                              updateLiveResolutionBadge()
-                          }, 180)
-                          return
-                      }
+                      // Keep BOTH Rear & Front cameras bound and streaming live even in 4K+ mode!
 
                       var concurrentBack: CameraSelector? = null
                       var concurrentFront: CameraSelector? = null
@@ -1496,23 +1490,7 @@ jobs:
                   flashOverlay.alpha = 0.90f
                   flashOverlay.animate().alpha(0f).setDuration(180).start()
 
-                  // If in 4K+ Max-Res single-stream mode, snap Rear at full 4K, switch to Front 42MP at full 4K, snap Front, and composite!
-                  val provider = cachedProvider
-                  if (proMaxResMode && provider != null) {
-                      heldRearMaxResBmp = previewRear.bitmap
-                      try {
-                          provider.unbindAll()
-                          val pFrontMax = buildHighResPreview(previewFront.surfaceProvider, preferBurstMax = true, isFront = true)
-                          frontCamera = provider.bindToLifecycle(this, defaultFrontSelector, pFrontMax)
-                          mainHandler.postDelayed({
-                              heldFrontMaxResBmp = previewFront.bitmap
-                              captureDualCompositeToGallery(heldRearMaxResBmp, heldFrontMaxResBmp)
-                              bindDualCamerasSafely()
-                          }, 420)
-                          return
-                      } catch (ignored: Exception) {
-                      }
-                  }
+                  // Capture both live Rear and Front high-res bitmaps simultaneously without unbinding!
 
                   captureDualCompositeToGallery(previewRear.bitmap, previewFront.bitmap)
               }
