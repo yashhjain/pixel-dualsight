@@ -140,7 +140,6 @@ jobs:
           import android.graphics.Outline
           import android.graphics.Paint
           import android.graphics.Path
-          import android.graphics.Rect
           import android.graphics.RectF
           import android.graphics.RenderEffect
           import android.graphics.SurfaceTexture
@@ -476,15 +475,14 @@ jobs:
 
               override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
+              @Suppress("DEPRECATION")
               override fun onConfigurationChanged(newConfig: Configuration) {
                   super.onConfigurationChanged(newConfig)
                   updateOrientationLayout(newConfig.orientation)
-                  val displayRotation = when (windowManager.defaultDisplay?.rotation ?: Surface.ROTATION_0) {
-                      Surface.ROTATION_0 -> Surface.ROTATION_0
-                      Surface.ROTATION_90 -> Surface.ROTATION_90
-                      Surface.ROTATION_180 -> Surface.ROTATION_180
-                      Surface.ROTATION_270 -> Surface.ROTATION_270
-                      else -> Surface.ROTATION_0
+                  val displayRotation = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                      display?.rotation ?: Surface.ROTATION_0
+                  } else {
+                      windowManager.defaultDisplay?.rotation ?: Surface.ROTATION_0
                   }
                   rearPreviewUseCase?.targetRotation = displayRotation
                   frontPreviewUseCase?.targetRotation = displayRotation
@@ -1897,52 +1895,16 @@ jobs:
                           frontSensorMp = max(8, (maxFrontPixels / 1_000_000.0).roundToInt())
                       }
 
-                      val backInfos = provider.availableCameraInfos.filter {
-                          it.lensFacing == CameraSelector.LENS_FACING_BACK
-                      }
                       discoveredRearLenses.clear()
-                      val seenRatios = mutableListOf<Float>()
-
-                      for (info in backInfos.sortedBy { it.intrinsicZoomRatio }) {
-                          val rawRatio = info.intrinsicZoomRatio
-                          val cleanRatio = (rawRatio * 10f).roundToInt() / 10f
-                          if (seenRatios.any { abs(it - cleanRatio) < 0.15f }) continue
-                          seenRatios.add(cleanRatio)
-
-                          minZ = min(minZ, cleanRatio)
-                          val roleKey = when {
-                              cleanRatio < 0.9f -> "UW_${cleanRatio}"
-                              cleanRatio > 1.5f -> "TELE_${cleanRatio}"
-                              else -> "WIDE_${cleanRatio}"
-                          }
-                          val subName = when {
-                              cleanRatio < 0.9f -> "UW"
-                              cleanRatio > 1.5f -> "Tele"
-                              else -> "Main"
-                          }
-                          discoveredRearLenses.add(
-                              DiscoveredLens(
-                                  key = roleKey,
-                                  ratioLabel = formatZoomLabel(cleanRatio),
-                                  subLabel = subName,
-                                  targetZoom = cleanRatio,
-                                  selector = info.cameraSelector
-                              )
-                          )
+                      if (minZ < 0.9f) {
+                          val uwVal = (minZ * 10f).roundToInt() / 10f
+                          discoveredRearLenses.add(DiscoveredLens("UW", formatZoomLabel(uwVal), "UW", uwVal, logicalBackSelector))
                       }
-
-                      if (discoveredRearLenses.size <= 1) {
-                          discoveredRearLenses.clear()
-                          if (minZ < 0.9f) {
-                              val uwVal = (minZ * 10f).roundToInt() / 10f
-                              discoveredRearLenses.add(DiscoveredLens("UW", formatZoomLabel(uwVal), "UW", uwVal, logicalBackSelector))
-                          }
-                          discoveredRearLenses.add(DiscoveredLens("WIDE", "1x", "Main", 1.0f, logicalBackSelector))
-                          if (maxZ >= 5.0f) {
-                              discoveredRearLenses.add(DiscoveredLens("TELE", "5x", "Tele", 5.0f, logicalBackSelector))
-                          } else if (maxZ >= 3.0f) {
-                              discoveredRearLenses.add(DiscoveredLens("TELE", "3x", "Tele", 3.0f, logicalBackSelector))
-                          }
+                      discoveredRearLenses.add(DiscoveredLens("WIDE", "1x", "Main", 1.0f, logicalBackSelector))
+                      if (maxZ >= 5.0f) {
+                          discoveredRearLenses.add(DiscoveredLens("TELE", "5x", "Tele", 5.0f, logicalBackSelector))
+                      } else if (maxZ >= 2.5f) {
+                          discoveredRearLenses.add(DiscoveredLens("TELE", "3x", "Tele", 3.0f, logicalBackSelector))
                       }
 
                       deviceMinZoom = minZ.coerceIn(0.4f, 1.0f)
@@ -2238,7 +2200,7 @@ jobs:
                           )
                       )
                   if (preferBurstMax) {
-                      resBuilder.setAllowedResolutionMode(ResolutionSelector.PREFER_HIGHER_RESOLUTION_OVER_CAPTURE_RATE)
+                      resBuilder.setAllowedResolutionMode(ResolutionSelector.ALLOWED_RESOLUTIONS_SLOW_MAGNIFICATION)
                   }
                   val preview = Preview.Builder()
                       .setResolutionSelector(resBuilder.build())
