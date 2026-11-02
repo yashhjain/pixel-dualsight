@@ -127,6 +127,7 @@ jobs:
           import android.Manifest
           import android.annotation.SuppressLint
           import android.app.AlertDialog
+          import android.content.ContentUris
           import android.content.ContentValues
           import android.content.Context
           import android.content.Intent
@@ -456,6 +457,7 @@ jobs:
                   }
                   mainHandler.removeCallbacks(histogramTickRunnable)
                   mainHandler.postDelayed(histogramTickRunnable, 400L)
+                  refreshGalleryState()
               }
 
               override fun onPause() {
@@ -660,6 +662,12 @@ jobs:
 
                   stageCard.addView(rearContainer)
                   stageCard.addView(frontContainer)
+
+                  stageCard.addOnLayoutChangeListener { _, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
+                      if ((right - left) != (oldRight - oldLeft) || (bottom - top) != (oldBottom - oldTop)) {
+                          stageCard.post { applyFrontCameraLayout() }
+                      }
+                  }
 
                   polaroidFooterBar = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
@@ -1253,6 +1261,67 @@ jobs:
                   setContentView(rootLayout)
               }
 
+              private fun loadThumb(uri: Uri): Bitmap? {
+                  return try {
+                      contentResolver.loadThumbnail(uri, Size(720, 960), null)
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+
+              // Re-sync thumbnail + counter with what actually exists in the gallery (handles deleted photos)
+              private fun refreshGalleryState() {
+                  if (isCapturingPhoto) return
+                  ioExecutor.execute {
+                      var latest: Uri? = null
+                      var count = 0
+                      try {
+                          val projection = arrayOf(MediaStore.Images.Media._ID, MediaStore.Images.Media.DISPLAY_NAME)
+                          contentResolver.query(
+                              MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                              projection,
+                              "${MediaStore.Images.Media.RELATIVE_PATH} LIKE ?",
+                              arrayOf("Pictures/DualSightPro%"),
+                              "${MediaStore.Images.Media.DATE_ADDED} DESC, ${MediaStore.Images.Media._ID} DESC"
+                          )?.use { c ->
+                              val idCol = c.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+                              val nameCol = c.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
+                              while (c.moveToNext()) {
+                                  val name = c.getString(nameCol) ?: ""
+                                  if (name.contains("_Rear_") || name.contains("_Front_")) continue
+                                  count += 1
+                                  if (latest == null) {
+                                      latest = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, c.getLong(idCol))
+                                  }
+                              }
+                          }
+                      } catch (e: Exception) {
+                          return@execute
+                      }
+                      val found: Uri? = latest
+                      val total = count
+                      val thumb: Bitmap? = if (found != null) loadThumb(found) else null
+                      mainHandler.post {
+                          if (isCapturingPhoto) return@post
+                          lastSavedUri = found
+                          captureCount = total
+                          if (found == null) {
+                              lastCapturedBitmap = null
+                              thumbView.setImageDrawable(null)
+                              photoCountBadge.visibility = View.GONE
+                              quickReviewDrawer.visibility = View.GONE
+                          } else {
+                              if (thumb != null) {
+                                  lastCapturedBitmap = thumb
+                                  thumbView.setImageBitmap(thumb)
+                              }
+                              photoCountBadge.text = total.toString()
+                              photoCountBadge.visibility = View.VISIBLE
+                          }
+                      }
+                  }
+              }
+
               private fun updateModeStripUI() {
                   for ((mIdx, tab) in modeTabs) {
                       if (mIdx == captureMode) {
@@ -1367,14 +1436,21 @@ jobs:
                   detachFromParent(stageCard)
                   detachFromParent(zoomCapsuleLayout)
                   detachFromParent(lensScroll)
+                  detachFromParent(lensCardsRowLayout)
                   detachFromParent(modeStripRow)
                   detachFromParent(leftControlsGroup)
                   detachFromParent(shutterOuterRing)
                   detachFromParent(btnSwapCams)
                   detachFromParent(shutterRowContainer)
                   detachFromParent(bottomDeck)
+                  hasCustomPipPos = false
 
                   val isLandscape = (screenOrientation == Configuration.ORIENTATION_LANDSCAPE)
+
+                  leftControlsGroup.orientation = if (isLandscape) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL
+                  leftControlsGroup.getChildAt(1)?.layoutParams = LinearLayout.LayoutParams(dp(46), dp(46)).apply {
+                      if (isLandscape) topMargin = dp(8) else leftMargin = dp(10)
+                  }
 
                   if (isLandscape) {
                       rootLayout.orientation = LinearLayout.HORIZONTAL
@@ -1387,30 +1463,30 @@ jobs:
                           bottomMargin = dp(6)
                       })
                       leftViewfinderColumn.addView(stageCard, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+                      leftViewfinderColumn.addView(modeStripRow, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                          topMargin = dp(6)
+                      })
 
-                      bottomDeck.orientation = LinearLayout.VERTICAL
-                      bottomDeck.gravity = Gravity.CENTER_HORIZONTAL
-                      bottomDeck.setPadding(dp(10), dp(6), dp(6), dp(6))
+                      // Side deck = [lens cards column] [zoom column] [thumb/AF + shutter + swap column]
+                      bottomDeck.orientation = LinearLayout.HORIZONTAL
+                      bottomDeck.gravity = Gravity.CENTER_VERTICAL
+                      bottomDeck.setPadding(dp(8), 0, 0, 0)
+
+                      lensCardsRowLayout.orientation = LinearLayout.VERTICAL
+                      bottomDeck.addView(lensCardsRowLayout, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                          rightMargin = dp(6)
+                      })
 
                       zoomCapsuleLayout.orientation = LinearLayout.VERTICAL
                       bottomDeck.addView(zoomCapsuleLayout, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                          bottomMargin = dp(8)
+                          rightMargin = dp(6)
                       })
 
-                      bottomDeck.addView(lensScroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                          bottomMargin = dp(8)
-                      })
-
-                      bottomDeck.addView(modeStripRow, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                          bottomMargin = dp(8)
-                      })
-
-                      shutterRowContainer.layoutParams = LinearLayout.LayoutParams(dp(84), LinearLayout.LayoutParams.MATCH_PARENT)
+                      shutterRowContainer.setPadding(0, 0, 0, 0)
                       shutterRowContainer.addView(leftControlsGroup, FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.CENTER_HORIZONTAL))
                       shutterRowContainer.addView(shutterOuterRing, FrameLayout.LayoutParams(dp(74), dp(74), Gravity.CENTER))
                       shutterRowContainer.addView(btnSwapCams, FrameLayout.LayoutParams(dp(72), dp(42), Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL))
-
-                      bottomDeck.addView(shutterRowContainer, LinearLayout.LayoutParams(dp(84), 0, 1f))
+                      bottomDeck.addView(shutterRowContainer, LinearLayout.LayoutParams(dp(84), LinearLayout.LayoutParams.MATCH_PARENT))
 
                       rootLayout.addView(leftViewfinderColumn, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
                       rootLayout.addView(bottomDeck, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.MATCH_PARENT))
@@ -1432,6 +1508,8 @@ jobs:
                           bottomMargin = dp(8)
                       })
 
+                      lensCardsRowLayout.orientation = LinearLayout.HORIZONTAL
+                      lensScroll.addView(lensCardsRowLayout)
                       bottomDeck.addView(lensScroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
                           bottomMargin = dp(8)
                       })
@@ -1529,6 +1607,8 @@ jobs:
                       lensCardsRowLayout.addView(card, LinearLayout.LayoutParams(dp(70), dp(42)).apply {
                           leftMargin = dp(3)
                           rightMargin = dp(3)
+                          topMargin = dp(2)
+                          bottomMargin = dp(2)
                       })
                   }
                   updateLensRoleCardsUI()
