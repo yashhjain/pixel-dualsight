@@ -1359,7 +1359,7 @@ jobs:
                   (v.parent as? ViewGroup)?.removeView(v)
               }
 
-              private fun updateOrientationLayout(orientation: Int) {
+              private fun updateOrientationLayout(screenOrientation: Int) {
                   rootLayout.removeAllViews()
                   bottomDeck.removeAllViews()
                   shutterRowContainer.removeAllViews()
@@ -1374,7 +1374,7 @@ jobs:
                   detachFromParent(shutterRowContainer)
                   detachFromParent(bottomDeck)
 
-                  val isLandscape = (orientation == Configuration.ORIENTATION_LANDSCAPE)
+                  val isLandscape = (screenOrientation == Configuration.ORIENTATION_LANDSCAPE)
 
                   if (isLandscape) {
                       rootLayout.orientation = LinearLayout.HORIZONTAL
@@ -2200,7 +2200,7 @@ jobs:
                           )
                       )
                   if (preferBurstMax) {
-                      resBuilder.setAllowedResolutionMode(ResolutionSelector.ALLOWED_RESOLUTIONS_SLOW_MAGNIFICATION)
+                      resBuilder.setAllowedResolutionMode(ResolutionSelector.PREFER_HIGHER_RESOLUTION_OVER_CAPTURE_RATE)
                   }
                   val preview = Preview.Builder()
                       .setResolutionSelector(resBuilder.build())
