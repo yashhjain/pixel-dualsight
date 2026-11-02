@@ -64,8 +64,8 @@ jobs:
                   applicationId = "com.pixel11.dualsight"
                   minSdk = 30
                   targetSdk = 34
-                  versionCode = 4
-                  versionName = "4.0.0"
+                  versionCode = 5
+                  versionName = "5.0.0"
               }
               buildTypes {
                   release {
@@ -104,7 +104,7 @@ jobs:
               <application
                   android:allowBackup="true"
                   android:hardwareAccelerated="true"
-                  android:label="Pixel 11 Dual Sight"
+                  android:label="Dual Sight Pro"
                   android:supportsRtl="true"
                   android:theme="@style/Theme.Material3.Dark.NoActionBar">
                   <activity
@@ -140,8 +140,11 @@ jobs:
           import android.graphics.Path
           import android.graphics.RectF
           import android.graphics.RenderEffect
+          import android.graphics.SurfaceTexture
           import android.graphics.Typeface
           import android.graphics.drawable.GradientDrawable
+          import android.hardware.camera2.CameraCharacteristics
+          import android.hardware.camera2.CameraManager
           import android.media.MediaActionSound
           import android.net.Uri
           import android.os.Build
@@ -160,6 +163,7 @@ jobs:
           import android.view.ViewOutlineProvider
           import android.view.WindowManager
           import android.widget.FrameLayout
+          import android.widget.HorizontalScrollView
           import android.widget.ImageView
           import android.widget.LinearLayout
           import android.widget.TextView
@@ -175,7 +179,6 @@ jobs:
           import androidx.camera.core.resolutionselector.AspectRatioStrategy
           import androidx.camera.core.resolutionselector.ResolutionSelector
           import androidx.camera.core.resolutionselector.ResolutionStrategy
-          import androidx.camera.extensions.ExtensionMode
           import androidx.camera.extensions.ExtensionsManager
           import androidx.camera.lifecycle.ProcessCameraProvider
           import androidx.camera.view.PreviewView
@@ -185,8 +188,17 @@ jobs:
           import kotlin.math.abs
           import kotlin.math.max
           import kotlin.math.min
+          import kotlin.math.roundToInt
 
           class MainActivity : AppCompatActivity() {
+
+              data class DiscoveredLens(
+                  val key: String,
+                  val ratioLabel: String,
+                  val subLabel: String,
+                  val targetZoom: Float,
+                  val selector: CameraSelector
+              )
 
               private lateinit var stageCard: FrameLayout
               private lateinit var rearContainer: FrameLayout
@@ -206,6 +218,8 @@ jobs:
               private lateinit var thumbView: ImageView
               private lateinit var photoCountBadge: TextView
               private lateinit var resolutionTelemetryBadge: TextView
+              private lateinit var zoomCapsuleLayout: LinearLayout
+              private lateinit var lensCardsRowLayout: LinearLayout
               private lateinit var btnViewDropdown: TextView
               private lateinit var btnLookDropdown: TextView
               private lateinit var btnMaxResChip: TextView
@@ -230,22 +244,27 @@ jobs:
               private var isBindingCameras = false
               private var isCapturingPhoto = false
 
-              // Pixel 11 Pro XL Triple Rear + 42MP Front Camera Selectors
+              // Dynamically discovered hardware profile of the installed Android device
+              private var deviceModelName: String = Build.MODEL ?: "Android"
+              private var rearSensorMp: Int = 50
+              private var frontSensorMp: Int = 12
+              private var deviceMinZoom: Float = 0.5f
+              private var deviceMaxZoom: Float = 10.0f
+              private var bestRear16x9Size: Size = Size(3840, 2160)
+              private var bestRear4x3Size: Size = Size(4000, 3000)
+              private var bestFront16x9Size: Size = Size(2560, 1440)
+              private var bestFront4x3Size: Size = Size(3264, 2448)
+
               private var logicalBackSelector: CameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
               private var defaultFrontSelector: CameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
-              private var ultraWideSelector: CameraSelector? = null
-              private var mainWideSelector: CameraSelector? = null
-              private var telephotoSelector: CameraSelector? = null
-              private var selectedLensRole: String = "AUTO" // "AUTO", "UW", "WIDE", "TELE"
+              private val discoveredRearLenses = mutableListOf<DiscoveredLens>()
+              private var dynamicZoomStops = listOf(0.5f, 1.0f, 2.0f, 5.0f, 10.0f)
+              private var selectedLensRole: String = "AUTO"
 
-              // Pro Max-Res Mode: Unlocks full single-sensor 4K/QHD+ ISP pipeline (50MP Rear + 42MP Front without Android concurrent HAL cap)
-              // with automatic sequential Dual-Snap when pressing Shutter!
+              // 4K+ Mode negotiates each sensor's highest native 4:3 resolution vs standard 16:9 widescreen preview
               private var proMaxResMode = false
-              private var heldRearMaxResBmp: Bitmap? = null
-              private var heldFrontMaxResBmp: Bitmap? = null
 
               private var currentZoom = 1.0f
-              private var frontZoom = 1.0f
               private var lastZoomApplyMs = 0L
               private var swapSlots = false
               private var torchEnabled = false
@@ -298,6 +317,15 @@ jobs:
                       if (strokeHex != null && strokeDp > 0) {
                           setStroke(dp(strokeDp), Color.parseColor(strokeHex))
                       }
+                  }
+              }
+
+              private fun formatZoomLabel(z: Float): String {
+                  val rounded1 = (z * 10f).roundToInt() / 10f
+                  return if (abs(rounded1 - rounded1.roundToInt()) < 0.05f) {
+                      "${rounded1.roundToInt()}x"
+                  } else {
+                      "${rounded1}x"
                   }
               }
 
@@ -355,15 +383,15 @@ jobs:
                       }
                   }
 
-                  // 4K+ Dual Max-Res Toggle (keeps BOTH Rear & Front cameras live using full-sensor 4:3 High-Resolution strategy + Ultra-HD 4K output)
-                  btnMaxResChip = buildIconCircleChip("4K+") {
+                  // Max-Res Toggle (switches both Rear & Front to highest device-supported 4:3 sensor resolution while keeping both live!)
+                  btnMaxResChip = buildIconCircleChip("MAX") {
                       proMaxResMode = !proMaxResMode
                       btnMaxResChip.background = if (proMaxResMode) circleDrawable("#FACC15") else circleDrawable("#2E3446", "#33FFFFFF", 1)
                       btnMaxResChip.setTextColor(if (proMaxResMode) Color.BLACK else Color.WHITE)
                       Toast.makeText(
                           this@MainActivity,
-                          if (proMaxResMode) "4K+ Dual Max-Res Active (Both Rear & Front Live)"
-                          else "Standard Dual Stream Active",
+                          if (proMaxResMode) "Max Sensor Resolution (${bestRear4x3Size.width}×${bestRear4x3Size.height} / ${bestFront4x3Size.width}×${bestFront4x3Size.height})"
+                          else "Widescreen 16:9 Stream (${bestRear16x9Size.width}×${bestRear16x9Size.height})",
                           Toast.LENGTH_SHORT
                       ).show()
                       bindDualCamerasSafely()
@@ -416,7 +444,7 @@ jobs:
                       bottomMargin = dp(6)
                   })
 
-                  // 2. EXPANSIVE QHD+ ROUNDED 24DP VIEWFINDER STAGE (Takes 75%+ of screen height)
+                  // 2. EXPANSIVE ROUNDED 24DP VIEWFINDER STAGE
                   stageCard = FrameLayout(this).apply {
                       background = pillDrawable("#000000", 24, "#29FFFFFF", 1)
                       clipChildren = true
@@ -462,9 +490,9 @@ jobs:
                   }
                   stageCard.addView(gridOverlayView, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
 
-                  // Subtle Top Resolution & Sensor Telemetry Pill (elevation = 18dp)
+                  // Live Device Model + Granted Stream Resolution Telemetry Pill (elevation = 18dp)
                   resolutionTelemetryBadge = TextView(this).apply {
-                      text = "50MP REAR • 42MP FRONT PDAF"
+                      text = "$deviceModelName • R:${rearSensorMp}MP • F:${frontSensorMp}MP"
                       textSize = 10f
                       setTextColor(Color.parseColor("#E2E8F0"))
                       typeface = Typeface.MONOSPACE
@@ -481,7 +509,7 @@ jobs:
                       rightMargin = dp(12)
                   })
 
-                  // Center / Tap Focus Assembly (Gold Focus Ring + Attached Pill Badge matching mockup 1:1, elevation = 22dp)
+                  // Center / Tap Focus Assembly (Gold Focus Ring + Attached Pill Badge, elevation = 22dp)
                   focusAssembly = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
                       gravity = Gravity.CENTER_VERTICAL
@@ -523,7 +551,7 @@ jobs:
                   }
 
                   focusTagSub = TextView(this).apply {
-                      text = "50MP • AF LOCKED"
+                      text = "${rearSensorMp}MP • AF LOCKED"
                       textSize = 9.5f
                       setTextColor(Color.WHITE)
                       typeface = Typeface.MONOSPACE
@@ -541,7 +569,7 @@ jobs:
 
                   stageCard.addView(focusAssembly, FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT))
 
-                  // Frosted Glass Top Dropdown Menus Overlay (elevation = 26dp inside top of stageCard)
+                  // Frosted Glass Top Dropdown Menus Overlay (elevation = 26dp)
                   dropdownOverlayContainer = FrameLayout(this).apply {
                       visibility = View.GONE
                       elevation = dp(26).toFloat()
@@ -636,7 +664,7 @@ jobs:
 
                   root.addView(stageCard, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
 
-                  // 3. STREAMLINED FLAGSHIP BOTTOM CAMERA DECK (Matches approved UI mockup 1:1)
+                  // 3. BOTTOM CAMERA DECK (Dynamically populated based on installed Android device's lenses & zoom range!)
                   val bottomDeck = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
                       gravity = Gravity.CENTER_HORIZONTAL
@@ -644,87 +672,32 @@ jobs:
                       setPadding(dp(8), dp(10), dp(8), dp(6))
                   }
 
-                  // ROW 1: PILL-SHAPED ZOOM CAPSULE (0.5x | 1x | 2x | 5x | 10x)
-                  val zoomCapsule = LinearLayout(this).apply {
+                  // ROW 1: DYNAMIC ZOOM CAPSULE (Populated from device's actual minZoom, optical lenses, and maxZoom)
+                  zoomCapsuleLayout = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
                       gravity = Gravity.CENTER
                       background = pillDrawable("#1A1D26", 26, "#28FFFFFF", 1)
                       setPadding(dp(6), dp(4), dp(6), dp(4))
                   }
-
-                  val zoomPresets = listOf(0.5f to "0.5x", 1.0f to "1x", 2.0f to "2x", 5.0f to "5x", 10.0f to "10x")
-                  for ((zVal, zLabel) in zoomPresets) {
-                      val btn = TextView(this).apply {
-                          text = zLabel
-                          gravity = Gravity.CENTER
-                          textSize = 12f
-                          typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
-                          setOnClickListener {
-                              it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-                              setZoomSmooth(zVal, fromPresetButton = true)
-                          }
-                      }
-                      deckZoomButtons[zVal] = btn
-                      zoomCapsule.addView(btn, LinearLayout.LayoutParams(dp(44), dp(36)).apply {
-                          leftMargin = dp(3)
-                          rightMargin = dp(3)
-                      })
-                  }
-                  updateZoomButtonsUI()
-
-                  bottomDeck.addView(zoomCapsule, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                  bottomDeck.addView(zoomCapsuleLayout, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
                       bottomMargin = dp(10)
                   })
 
-                  // ROW 2: 4 TWO-LINE LENS CARDS ("Auto / 3-Lens", "0.5x / UW", "1x / Main", "5x / Tele")
-                  val lensCardsRow = LinearLayout(this).apply {
+                  // ROW 2: DYNAMIC HARDWARE LENS CARDS ROW (Populated from discovered physical/logical cameras on device)
+                  val lensScroll = HorizontalScrollView(this).apply {
+                      isHorizontalScrollBarEnabled = false
+                  }
+                  lensCardsRowLayout = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
                       gravity = Gravity.CENTER
                   }
-
-                  val lensCardSpecs = listOf(
-                      Triple("AUTO", "Auto", "3-Lens"),
-                      Triple("UW", "0.5x", "UW"),
-                      Triple("WIDE", "1x", "Main"),
-                      Triple("TELE", "5x", "Tele")
-                  )
-                  for ((roleKey, topStr, subStr) in lensCardSpecs) {
-                      val card = LinearLayout(this).apply {
-                          orientation = LinearLayout.VERTICAL
-                          gravity = Gravity.CENTER
-                          setPadding(dp(12), dp(6), dp(12), dp(6))
-                          setOnClickListener {
-                              it.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
-                              switchPhysicalRearLens(roleKey)
-                          }
-                      }
-                      val topTv = TextView(this).apply {
-                          text = topStr
-                          textSize = 12f
-                          gravity = Gravity.CENTER
-                          typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
-                      }
-                      val subTv = TextView(this).apply {
-                          text = subStr
-                          textSize = 10f
-                          gravity = Gravity.CENTER
-                      }
-                      card.addView(topTv)
-                      card.addView(subTv)
-                      lensRoleCards[roleKey] = card
-                      lensRoleTopTexts[roleKey] = topTv
-                      lensRoleSubTexts[roleKey] = subTv
-
-                      lensCardsRow.addView(card, LinearLayout.LayoutParams(dp(74), dp(46)).apply {
-                          leftMargin = dp(4)
-                          rightMargin = dp(4)
-                      })
-                  }
-                  updateLensRoleCardsUI()
-
-                  bottomDeck.addView(lensCardsRow, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                  lensScroll.addView(lensCardsRowLayout)
+                  bottomDeck.addView(lensScroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
                       bottomMargin = dp(12)
                   })
+
+                  // Build initial default zoom & lens buttons (replaced immediately when device camera hardware is queried)
+                  rebuildDynamicZoomAndLensUI()
 
                   // ROW 3: MAIN SHUTTER ROW (FrameLayout locks Double-Ring Shutter to exact horizontal center!)
                   val shutterRow = FrameLayout(this).apply {
@@ -785,7 +758,7 @@ jobs:
                       leftMargin = dp(10)
                   })
 
-                  // Flagship Double-Ring Pixel Shutter Button (Locked to exact Gravity.CENTER of shutterRow!)
+                  // Flagship Double-Ring Shutter Button (Locked to exact Gravity.CENTER of shutterRow!)
                   val shutterOuterRing = FrameLayout(this).apply {
                       background = circleDrawable("#00000000", "#FFFFFF", 3)
                       setPadding(dp(5), dp(5), dp(5), dp(5))
@@ -835,10 +808,80 @@ jobs:
                   }
               }
 
+              // Dynamically build the Zoom Capsule and Lens Cards based on the installed device's discovered hardware!
+              private fun rebuildDynamicZoomAndLensUI() {
+                  zoomCapsuleLayout.removeAllViews()
+                  deckZoomButtons.clear()
+
+                  for (zVal in dynamicZoomStops) {
+                      val btn = TextView(this).apply {
+                          text = formatZoomLabel(zVal)
+                          gravity = Gravity.CENTER
+                          textSize = 12f
+                          typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+                          setOnClickListener {
+                              it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                              setZoomSmooth(zVal, fromPresetButton = true)
+                          }
+                      }
+                      deckZoomButtons[zVal] = btn
+                      zoomCapsuleLayout.addView(btn, LinearLayout.LayoutParams(dp(46), dp(36)).apply {
+                          leftMargin = dp(3)
+                          rightMargin = dp(3)
+                      })
+                  }
+                  updateZoomButtonsUI()
+
+                  lensCardsRowLayout.removeAllViews()
+                  lensRoleCards.clear()
+                  lensRoleTopTexts.clear()
+                  lensRoleSubTexts.clear()
+
+                  val lensCount = max(1, discoveredRearLenses.size)
+                  val cardsToBuild = mutableListOf(
+                      DiscoveredLens("AUTO", "Auto", if (lensCount > 1) "${lensCount}-Lens" else "${rearSensorMp}MP", 1.0f, logicalBackSelector)
+                  )
+                  cardsToBuild.addAll(discoveredRearLenses)
+
+                  for (lens in cardsToBuild) {
+                      val card = LinearLayout(this).apply {
+                          orientation = LinearLayout.VERTICAL
+                          gravity = Gravity.CENTER
+                          setPadding(dp(12), dp(6), dp(12), dp(6))
+                          setOnClickListener {
+                              it.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                              switchPhysicalRearLens(lens)
+                          }
+                      }
+                      val topTv = TextView(this).apply {
+                          text = lens.ratioLabel
+                          textSize = 12f
+                          gravity = Gravity.CENTER
+                          typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+                      }
+                      val subTv = TextView(this).apply {
+                          text = lens.subLabel
+                          textSize = 10f
+                          gravity = Gravity.CENTER
+                      }
+                      card.addView(topTv)
+                      card.addView(subTv)
+                      lensRoleCards[lens.key] = card
+                      lensRoleTopTexts[lens.key] = topTv
+                      lensRoleSubTexts[lens.key] = subTv
+
+                      lensCardsRowLayout.addView(card, LinearLayout.LayoutParams(dp(76), dp(46)).apply {
+                          leftMargin = dp(4)
+                          rightMargin = dp(4)
+                      })
+                  }
+                  updateLensRoleCardsUI()
+              }
+
               private fun buildIconCircleChip(symbol: String, onClick: () -> Unit): TextView {
                   return TextView(this).apply {
                       text = symbol
-                      textSize = 11f
+                      textSize = 10.5f
                       setTextColor(Color.WHITE)
                       gravity = Gravity.CENTER
                       typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
@@ -955,7 +998,7 @@ jobs:
               private fun setupTouchGestures() {
                   val scaleDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
                       override fun onScale(detector: ScaleGestureDetector): Boolean {
-                          val nextZoom = (currentZoom * detector.scaleFactor).coerceIn(0.5f, 10.0f)
+                          val nextZoom = (currentZoom * detector.scaleFactor).coerceIn(deviceMinZoom, deviceMaxZoom)
                           val now = SystemClock.uptimeMillis()
                           if (now - lastZoomApplyMs >= 28L) {
                               lastZoomApplyMs = now
@@ -1026,7 +1069,6 @@ jobs:
                               }
                               MotionEvent.ACTION_UP -> {
                                   if (!moved) {
-                                      // Tapping inside the Front Camera window triggers 42MP Front PDAF Autofocus!
                                       triggerTapToFocus(v.x + event.x, v.y + event.y, focusFront = isFrontView)
                                   }
                                   true
@@ -1050,17 +1092,16 @@ jobs:
                   val zoomBubble = focusAssembly.findViewById<TextView>(1001)
                   if (focusFront) {
                       zoomBubble?.text = "1x"
-                      focusTagTitle.text = "FRONT 42MP"
-                      focusTagSub.text = "PDAF • FOCUSING..."
+                      focusTagTitle.text = "FRONT ${frontSensorMp}MP"
+                      focusTagSub.text = "AF • FOCUSING..."
                   } else {
-                      val zStr = if (currentZoom < 1f) "0.5x" else "${currentZoom.toInt()}x"
-                      zoomBubble?.text = zStr
+                      zoomBubble?.text = formatZoomLabel(currentZoom)
                       focusTagTitle.text = when {
                           currentZoom < 0.92f -> "ULTRA-WIDE"
-                          currentZoom >= 4.8f -> "TELEPHOTO"
+                          currentZoom >= 2.8f -> "TELEPHOTO"
                           else -> "WIDE"
                       }
-                      focusTagSub.text = if (currentZoom < 0.92f || currentZoom >= 4.8f) "48MP • AF SCANNING" else "50MP • AF SCANNING"
+                      focusTagSub.text = "${rearSensorMp}MP • AF SCANNING"
                   }
 
                   focusAssembly.scaleX = 1.18f
@@ -1086,7 +1127,7 @@ jobs:
                           ).setAutoCancelDuration(4, TimeUnit.SECONDS).build()
                           val fFuture = frontCamera?.cameraControl?.startFocusAndMetering(fAction)
                           fFuture?.addListener({
-                              focusTagSub.text = "42MP • AF LOCKED"
+                              focusTagSub.text = "${frontSensorMp}MP • AF LOCKED"
                               shutterSound.play(MediaActionSound.FOCUS_COMPLETE)
                           }, ContextCompat.getMainExecutor(this))
                       } else {
@@ -1099,8 +1140,7 @@ jobs:
                           ).setAutoCancelDuration(4, TimeUnit.SECONDS).build()
                           val rFuture = rearCamera?.cameraControl?.startFocusAndMetering(rAction)
                           rFuture?.addListener({
-                              val mp = if (currentZoom < 0.92f || currentZoom >= 4.8f) "48MP" else "50MP"
-                              focusTagSub.text = "$mp • AF LOCKED"
+                              focusTagSub.text = "${rearSensorMp}MP • AF LOCKED"
                               shutterSound.play(MediaActionSound.FOCUS_COMPLETE)
                           }, ContextCompat.getMainExecutor(this))
                       }
@@ -1108,48 +1148,174 @@ jobs:
                   }
               }
 
-              private fun discoverPixelTripleCameras(provider: ProcessCameraProvider) {
-                  val backInfos = provider.availableCameraInfos.filter {
-                      it.lensFacing == CameraSelector.LENS_FACING_BACK
-                  }
-                  if (backInfos.isEmpty()) return
+              // Query the installed Android device's CameraManager & CameraX CameraInfo to auto-configure
+              // native resolutions, sensor megapixels, physical lenses, and zoom stops for THIS specific phone!
+              private fun discoverDeviceCameraProfile(provider: ProcessCameraProvider) {
+                  try {
+                      val cm = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+                      var maxRearPixels = 0L
+                      var maxFrontPixels = 0L
+                      var minZ = 1.0f
+                      var maxZ = 8.0f
 
-                  var minRatio = Float.MAX_VALUE
-                  var maxRatio = Float.MIN_VALUE
+                      for (camId in cm.cameraIdList) {
+                          val chars = cm.getCameraCharacteristics(camId)
+                          val facing = chars.get(CameraCharacteristics.LENS_FACING)
+                          val pixelArray = chars.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)
+                          val activeRect = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+                          val mpCount = if (pixelArray != null) {
+                              pixelArray.width.toLong() * pixelArray.height.toLong()
+                          } else if (activeRect != null) {
+                              activeRect.width().toLong() * activeRect.height().toLong()
+                          } else 0L
 
-                  for (info in backInfos) {
-                      val ratio = info.intrinsicZoomRatio
-                      if (ratio < minRatio) {
-                          minRatio = ratio
-                          ultraWideSelector = info.cameraSelector
+                          val streamMap = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                          val outputSizes = streamMap?.getOutputSizes(SurfaceTexture::class.java) ?: emptyArray()
+
+                          if (facing == CameraCharacteristics.LENS_FACING_BACK) {
+                              if (mpCount > maxRearPixels) maxRearPixels = mpCount
+
+                              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                  val zRange = chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+                                  if (zRange != null) {
+                                      minZ = min(minZ, zRange.lower)
+                                      maxZ = max(maxZ, zRange.upper)
+                                  }
+                              } else {
+                                  val digMax = chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 8.0f
+                                  maxZ = max(maxZ, digMax)
+                              }
+
+                              val best16x9 = pickBestResolution(outputSizes, 16f / 9f)
+                              val best4x3 = pickBestResolution(outputSizes, 4f / 3f)
+                              if (best16x9.width * best16x9.height > bestRear16x9Size.width * bestRear16x9Size.height) {
+                                  bestRear16x9Size = best16x9
+                              }
+                              if (best4x3.width * best4x3.height > bestRear4x3Size.width * bestRear4x3Size.height) {
+                                  bestRear4x3Size = best4x3
+                              }
+                          } else if (facing == CameraCharacteristics.LENS_FACING_FRONT) {
+                              if (mpCount > maxFrontPixels) maxFrontPixels = mpCount
+
+                              val best16x9 = pickBestResolution(outputSizes, 16f / 9f)
+                              val best4x3 = pickBestResolution(outputSizes, 4f / 3f)
+                              if (best16x9.width * best16x9.height > bestFront16x9Size.width * bestFront16x9Size.height) {
+                                  bestFront16x9Size = best16x9
+                              }
+                              if (best4x3.width * best4x3.height > bestFront4x3Size.width * bestFront4x3Size.height) {
+                                  bestFront4x3Size = best4x3
+                              }
+                          }
                       }
-                      if (ratio > maxRatio) {
-                          maxRatio = ratio
-                          telephotoSelector = info.cameraSelector
+
+                      if (maxRearPixels > 0) {
+                          rearSensorMp = max(12, (maxRearPixels / 1_000_000.0).roundToInt())
                       }
-                      if (abs(ratio - 1.0f) < 0.2f && mainWideSelector == null) {
-                          mainWideSelector = info.cameraSelector
+                      if (maxFrontPixels > 0) {
+                          frontSensorMp = max(8, (maxFrontPixels / 1_000_000.0).roundToInt())
                       }
-                  }
-                  if (mainWideSelector == null) {
-                      mainWideSelector = backInfos.first().cameraSelector
+
+                      // Discover distinct Rear Lenses via CameraInfo.intrinsicZoomRatio
+                      val backInfos = provider.availableCameraInfos.filter {
+                          it.lensFacing == CameraSelector.LENS_FACING_BACK
+                      }
+                      discoveredRearLenses.clear()
+                      val seenRatios = mutableListOf<Float>()
+
+                      for (info in backInfos.sortedBy { it.intrinsicZoomRatio }) {
+                          val rawRatio = info.intrinsicZoomRatio
+                          val cleanRatio = (rawRatio * 10f).roundToInt() / 10f
+                          if (seenRatios.any { abs(it - cleanRatio) < 0.15f }) continue
+                          seenRatios.add(cleanRatio)
+
+                          minZ = min(minZ, cleanRatio)
+                          val roleKey = when {
+                              cleanRatio < 0.9f -> "UW_${cleanRatio}"
+                              cleanRatio > 1.5f -> "TELE_${cleanRatio}"
+                              else -> "WIDE_${cleanRatio}"
+                          }
+                          val subName = when {
+                              cleanRatio < 0.9f -> "UW"
+                              cleanRatio > 1.5f -> "Tele"
+                              else -> "Main"
+                          }
+                          discoveredRearLenses.add(
+                              DiscoveredLens(
+                                  key = roleKey,
+                                  ratioLabel = formatZoomLabel(cleanRatio),
+                                  subLabel = subName,
+                                  targetZoom = cleanRatio,
+                                  selector = info.cameraSelector
+                              )
+                          )
+                      }
+
+                      // If the phone only exposes the logical multi-camera in availableCameraInfos,
+                      // build logical lens shortcuts based on its hardware zoom bounds (minZ .. maxZ)
+                      if (discoveredRearLenses.size <= 1) {
+                          discoveredRearLenses.clear()
+                          if (minZ < 0.9f) {
+                              val uwVal = (minZ * 10f).roundToInt() / 10f
+                              discoveredRearLenses.add(DiscoveredLens("UW", formatZoomLabel(uwVal), "UW", uwVal, logicalBackSelector))
+                          }
+                          discoveredRearLenses.add(DiscoveredLens("WIDE", "1x", "Main", 1.0f, logicalBackSelector))
+                          if (maxZ >= 5.0f) {
+                              discoveredRearLenses.add(DiscoveredLens("TELE", "5x", "Tele", 5.0f, logicalBackSelector))
+                          } else if (maxZ >= 3.0f) {
+                              discoveredRearLenses.add(DiscoveredLens("TELE", "3x", "Tele", 3.0f, logicalBackSelector))
+                          }
+                      }
+
+                      deviceMinZoom = minZ.coerceIn(0.4f, 1.0f)
+                      deviceMaxZoom = maxZ.coerceIn(2.0f, 30.0f)
+
+                      // Build dynamic Zoom Capsule stops tailored to THIS phone's lenses & zoom limits
+                      val stops = sortedSetOf<Float>()
+                      if (deviceMinZoom < 0.92f) {
+                          stops.add((deviceMinZoom * 10f).roundToInt() / 10f)
+                      }
+                      stops.add(1.0f)
+                      if (deviceMaxZoom >= 2.0f) stops.add(2.0f)
+                      for (lens in discoveredRearLenses) {
+                          if (lens.targetZoom > 1.4f && lens.targetZoom <= deviceMaxZoom) {
+                              stops.add(lens.targetZoom)
+                          }
+                      }
+                      if (stops.none { it > 2.5f } && deviceMaxZoom >= 4.0f) {
+                          stops.add(min(5.0f, deviceMaxZoom))
+                      }
+                      val topPreset = when {
+                          deviceMaxZoom >= 10.0f -> 10.0f
+                          deviceMaxZoom >= 8.0f -> 8.0f
+                          else -> (deviceMaxZoom * 10f).roundToInt() / 10f
+                      }
+                      if (topPreset > 2.0f) stops.add(topPreset)
+
+                      dynamicZoomStops = stops.toList().take(6)
+                      rebuildDynamicZoomAndLensUI()
+                  } catch (ignored: Exception) {
                   }
               }
 
-              private fun switchPhysicalRearLens(roleKey: String) {
-                  selectedLensRole = roleKey
-                  updateLensRoleCardsUI()
-                  val targetZoomForRole = when (roleKey) {
-                      "UW" -> 0.5f
-                      "TELE" -> 5.0f
-                      else -> 1.0f
+              private fun pickBestResolution(sizes: Array<Size>, targetAspect: Float): Size {
+                  if (sizes.isEmpty()) return Size(1920, 1080)
+                  val matchingAspect = sizes.filter { s ->
+                      val ratio = s.width.toFloat() / s.height.toFloat().coerceAtLeast(1f)
+                      abs(ratio - targetAspect) < 0.12f
                   }
-                  currentZoom = targetZoomForRole
+                  val pool = if (matchingAspect.isNotEmpty()) matchingAspect else sizes.toList()
+                  return pool.maxByOrNull { it.width.toLong() * it.height.toLong() } ?: Size(1920, 1080)
+              }
+
+              private fun switchPhysicalRearLens(lens: DiscoveredLens) {
+                  selectedLensRole = lens.key
+                  updateLensRoleCardsUI()
+                  currentZoom = lens.targetZoom
                   bindDualCamerasSafely()
               }
 
               private fun setZoomSmooth(targetZoom: Float, fromPresetButton: Boolean) {
-                  val clamped = targetZoom.coerceIn(0.5f, 10.0f)
+                  val clamped = targetZoom.coerceIn(deviceMinZoom, deviceMaxZoom)
                   currentZoom = clamped
                   updateZoomButtonsUI()
 
@@ -1157,7 +1323,7 @@ jobs:
                   if (cam != null) {
                       val zoomState = cam.cameraInfo.zoomState.value
                       val minZ = zoomState?.minZoomRatio ?: 1.0f
-                      val maxZ = zoomState?.maxZoomRatio ?: 8.0f
+                      val maxZ = zoomState?.maxZoomRatio ?: deviceMaxZoom
 
                       if (clamped >= minZ && clamped <= maxZ) {
                           cam.cameraControl.setZoomRatio(clamped)
@@ -1165,31 +1331,27 @@ jobs:
                           previewRear.scaleY = 1.0f
                           updateLiveResolutionBadge()
                           return
-                      } else if (fromPresetButton && clamped < minZ && ultraWideSelector != null && selectedLensRole != "UW") {
-                          selectedLensRole = "UW"
-                          updateLensRoleCardsUI()
-                          bindDualCamerasSafely()
-                          return
-                      } else if (fromPresetButton && clamped >= 5.0f && maxZ < 5.0f && telephotoSelector != null && selectedLensRole != "TELE") {
-                          selectedLensRole = "TELE"
-                          updateLensRoleCardsUI()
-                          bindDualCamerasSafely()
-                          return
-                      } else {
-                          val hwZoom = clamped.coerceIn(minZ, maxZ)
-                          cam.cameraControl.setZoomRatio(hwZoom)
-                          val extraScale = (clamped / hwZoom).coerceIn(0.85f, 3.5f)
-                          previewRear.scaleX = extraScale
-                          previewRear.scaleY = extraScale
-                          updateLiveResolutionBadge()
-                          return
+                      } else if (fromPresetButton) {
+                          val matchingLens = discoveredRearLenses.minByOrNull { abs(it.targetZoom - clamped) }
+                          if (matchingLens != null && abs(matchingLens.targetZoom - clamped) < 0.35f && selectedLensRole != matchingLens.key) {
+                              selectedLensRole = matchingLens.key
+                              updateLensRoleCardsUI()
+                              bindDualCamerasSafely()
+                              return
+                          }
                       }
+                      val hwZoom = clamped.coerceIn(minZ, maxZ)
+                      cam.cameraControl.setZoomRatio(hwZoom)
+                      val extraScale = (clamped / hwZoom).coerceIn(0.85f, 3.5f)
+                      previewRear.scaleX = extraScale
+                      previewRear.scaleY = extraScale
+                      updateLiveResolutionBadge()
                   }
               }
 
               private fun updateZoomButtonsUI() {
                   for ((zVal, btn) in deckZoomButtons) {
-                      val selected = abs(currentZoom - zVal) < 0.14f
+                      val selected = abs(currentZoom - zVal) < 0.12f
                       if (selected) {
                           btn.setTextColor(Color.BLACK)
                           btn.background = circleDrawable("#FACC15")
@@ -1203,9 +1365,9 @@ jobs:
               private fun updateLiveResolutionBadge() {
                   val rRes = rearPreviewUseCase?.resolutionInfo?.resolution
                   val fRes = if (frontCamera != null) frontPreviewUseCase?.resolutionInfo?.resolution else null
-                  val rText = if (rRes != null) "R:${rRes.width}×${rRes.height}" else "R:50MP"
-                  val fText = if (fRes != null) "F:${fRes.width}×${fRes.height}" else "F:42MP"
-                  val modePrefix = if (proMaxResMode) "4K MAX • " else ""
+                  val rText = if (rRes != null) "R:${rRes.width}×${rRes.height}" else "R:${rearSensorMp}MP"
+                  val fText = if (fRes != null) "F:${fRes.width}×${fRes.height}" else "F:${frontSensorMp}MP"
+                  val modePrefix = if (proMaxResMode) "MAX • " else ""
                   resolutionTelemetryBadge.text = "$modePrefix$rText • $fText"
               }
 
@@ -1293,15 +1455,18 @@ jobs:
                   }
               }
 
-              // Build high-resolution Preview streams using CameraX ResolutionSelector on both Rear & Front
+              // Build Preview stream using the exact highest resolutions discovered on THIS Android device'sRear & Front sensors!
               private fun buildHighResPreview(surfaceProvider: Preview.SurfaceProvider, preferBurstMax: Boolean, isFront: Boolean): Preview {
                   val aspectStrategy = if (proMaxResMode) {
-                      // 50MP Rear & 42MP Front sensors on Pixel 11 Pro XL are native 4:3 full-sensor readout
                       AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY
                   } else {
                       AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY
                   }
-                  val targetSize = if (proMaxResMode) Size(4000, 3000) else Size(3840, 2160)
+                  val targetSize = if (isFront) {
+                      if (proMaxResMode) bestFront4x3Size else bestFront16x9Size
+                  } else {
+                      if (proMaxResMode) bestRear4x3Size else bestRear16x9Size
+                  }
                   val resBuilder = ResolutionSelector.Builder()
                       .setAspectRatioStrategy(aspectStrategy)
                       .setResolutionStrategy(
@@ -1326,7 +1491,7 @@ jobs:
                   future.addListener({
                       val provider = future.get()
                       cachedProvider = provider
-                      discoverPixelTripleCameras(provider)
+                      discoverDeviceCameraProfile(provider)
                       val extFuture = ExtensionsManager.getInstanceAsync(this, provider)
                       extFuture.addListener({
                           try { cachedExtensions = extFuture.get() } catch (ignored: Exception) {}
@@ -1343,14 +1508,8 @@ jobs:
                   try {
                       cameraProvider.unbindAll()
 
-                      val targetRearSelector: CameraSelector = when (selectedLensRole) {
-                          "UW" -> ultraWideSelector ?: logicalBackSelector
-                          "TELE" -> telephotoSelector ?: logicalBackSelector
-                          "WIDE" -> mainWideSelector ?: logicalBackSelector
-                          else -> logicalBackSelector
-                      }
-
-                      // Keep BOTH Rear & Front cameras bound and streaming live even in 4K+ mode!
+                      val matchedLens = discoveredRearLenses.firstOrNull { it.key == selectedLensRole }
+                      val targetRearSelector: CameraSelector = matchedLens?.selector ?: logicalBackSelector
 
                       var concurrentBack: CameraSelector? = null
                       var concurrentFront: CameraSelector? = null
@@ -1371,7 +1530,7 @@ jobs:
 
                       var boundSuccess = false
 
-                      // Tier 1: Try binding High-Resolution 4K/QHD+ ResolutionSelector on BOTH Rear (50MP) & Front (42MP) simultaneously!
+                      // Keep BOTH Rear & Front cameras bound and streaming live using device-discovered resolutions!
                       if (concurrentFront != null) {
                           for (allowHigherMode in listOf(true, false)) {
                               if (boundSuccess) break
@@ -1403,7 +1562,7 @@ jobs:
                           }
                       }
 
-                      // Tier 2: Try default concurrent camera pair with High-Res ResolutionSelector on both Rear & Front
+                      // Tier 2: Default concurrent camera pair with device-discovered resolution selector
                       if (!boundSuccess && concurrentBack != null && concurrentFront != null) {
                           try {
                               val pRearHi = buildHighResPreview(previewRear.surfaceProvider, preferBurstMax = false, isFront = false)
@@ -1431,7 +1590,7 @@ jobs:
                           }
                       }
 
-                      // Tier 3: Fallback to single high-res rear camera
+                      // Tier 3: Fallback to single rear camera only if the device does not support ConcurrentCamera
                       if (!boundSuccess) {
                           val pRearMax = buildHighResPreview(previewRear.surfaceProvider, preferBurstMax = true, isFront = false)
                           rearCamera = cameraProvider.bindToLifecycle(this, targetRearSelector, pRearMax)
@@ -1490,12 +1649,10 @@ jobs:
                   flashOverlay.alpha = 0.90f
                   flashOverlay.animate().alpha(0f).setDuration(180).start()
 
-                  // Capture both live Rear and Front high-res bitmaps simultaneously without unbinding!
-
                   captureDualCompositeToGallery(previewRear.bitmap, previewFront.bitmap)
               }
 
-              // Render composite at full QHD+ Pixel 11 Pro XL Super Actua resolution (up to 2160 x 3840)
+              // Render composite matched to the installed Android device's display density & resolution
               private fun captureDualCompositeToGallery(rearBmp: Bitmap?, frontBmp: Bitmap?) {
                   try {
                       if (rearBmp == null && frontBmp == null) {
@@ -1504,10 +1661,11 @@ jobs:
                           return
                       }
 
-                      val stageW = stageCard.width.takeIf { it > 0 } ?: 1344
-                      val stageH = stageCard.height.takeIf { it > 0 } ?: 2400
-                      // Scale output canvas to full Pixel 11 Pro XL QHD+ / 4K density
-                      val scaleFactor = max(1.0f, 2160f / stageW.toFloat())
+                      val displayW = resources.displayMetrics.widthPixels.coerceAtLeast(1080)
+                      val stageW = stageCard.width.takeIf { it > 0 } ?: displayW
+                      val stageH = stageCard.height.takeIf { it > 0 } ?: resources.displayMetrics.heightPixels
+                      val targetOutWidth = max(displayW, bestRear16x9Size.height).coerceIn(1080, 2560)
+                      val scaleFactor = max(1.0f, targetOutWidth.toFloat() / stageW.toFloat())
                       val outW = (stageW * scaleFactor).toInt()
                       val outH = (stageH * scaleFactor).toInt()
 
@@ -1578,14 +1736,15 @@ jobs:
                       thumbView.animate().scaleX(1f).scaleY(1f).setDuration(200).start()
 
                       val chosenLookLabel = lookLabels[lookIndex]
-                      val chosenZoomLabel = String.format("%.1fx", currentZoom)
+                      val chosenZoomLabel = formatZoomLabel(currentZoom)
+                      val safeModel = deviceModelName.replace(Regex("[^A-Za-z0-9]"), "")
 
                       ioExecutor.execute {
                           try {
                               val values = ContentValues().apply {
-                                  put(MediaStore.Images.Media.DISPLAY_NAME, "Pixel11Pro_QHD_" + System.currentTimeMillis() + ".jpg")
+                                  put(MediaStore.Images.Media.DISPLAY_NAME, "${safeModel}_DualSight_" + System.currentTimeMillis() + ".jpg")
                                   put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-                                  put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Pixel11DualSight")
+                                  put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/DualSightPro")
                               }
                               val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
                               if (uri != null) {
@@ -1664,6 +1823,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "v4.0.${{ github.run_number }}" Pixel11-DualSight.apk \
-            --title "Pixel 11 Pro XL Dual Sight APK (Build #${{ github.run_number }})" \
-            --notes "Tap **Pixel11-DualSight.apk** under Assets below to download and install directly on your Pixel 11 Pro XL."
+          gh release create "v5.0.${{ github.run_number }}" Pixel11-DualSight.apk \
+            --title "Dual Sight Pro APK (Build #${{ github.run_number }})" \
+            --notes "Tap **Pixel11-DualSight.apk** under Assets below to download and install directly on your Android device."
