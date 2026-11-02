@@ -1259,7 +1259,7 @@ jobs:
                   for ((mIdx, tab) in modeTabs) {
                       if (mIdx == captureMode) {
                           tab.setTextColor(Color.parseColor("#FACC15"))
-                          tab.typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+                          tab.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD))
                           tab.background = pillDrawable("#26FACC15", 14)
                       } else {
                           tab.setTextColor(Color.parseColor("#94A3B8"))
