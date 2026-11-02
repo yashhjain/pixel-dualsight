@@ -2545,7 +2545,7 @@ jobs:
                           if (layoutMode == 0 || layoutMode == 1) {
                               val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                                   style = Paint.Style.STROKE
-                                  color = Color.WHITE
+                                  setColor(Color.WHITE)
                                   strokeWidth = dp(2) * scaleFactor
                               }
                               if (layoutMode == 1) {
@@ -2559,13 +2559,13 @@ jobs:
                       if (layoutMode == 5) {
                           val footerTop = (stageH - dp(56)) * scaleFactor
                           val exifPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                              color = Color.parseColor("#334155")
+                              setColor(Color.parseColor("#334155"))
                               textSize = dp(11) * scaleFactor
                               typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
                               textAlign = Paint.Align.CENTER
                           }
                           val capPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                              color = Color.parseColor("#0F172A")
+                              setColor(Color.parseColor("#0F172A"))
                               textSize = dp(13) * scaleFactor
                               typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
                               textAlign = Paint.Align.CENTER
@@ -2665,7 +2665,7 @@ jobs:
 
               private class GridOverlayView(context: Context) : View(context) {
                   private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                      color = Color.parseColor("#44FFFFFF")
+                      setColor(Color.parseColor("#44FFFFFF"))
                       strokeWidth = 2f
                       style = Paint.Style.STROKE
                   }
@@ -2689,7 +2689,7 @@ jobs:
                       strokeCap = Paint.Cap.ROUND
                   }
                   private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                      color = Color.WHITE
+                      setColor(Color.WHITE)
                       textSize = 26f
                       typeface = Typeface.MONOSPACE
                       textAlign = Paint.Align.LEFT
@@ -2706,7 +2706,7 @@ jobs:
                       val cy = height / 2f
                       val halfLen = min(width, height) * 0.24f
                       val isLevel = abs(angleDeg) < 1.2f
-                      barPaint.color = if (isLevel) Color.parseColor("#34D399") else Color.parseColor("#88FACC15")
+                      barPaint.setColor(if (isLevel) Color.parseColor("#34D399") else Color.parseColor("#88FACC15"))
 
                       canvas.save()
                       canvas.rotate(-angleDeg.coerceIn(-45f, 45f), cx, cy)
@@ -2721,15 +2721,15 @@ jobs:
               private class HistogramView(context: Context) : View(context) {
                   private var currentBins = FloatArray(32) { 0.2f }
                   private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                      color = Color.parseColor("#8811131C")
+                      setColor(Color.parseColor("#8811131C"))
                       style = Paint.Style.FILL
                   }
                   private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                      color = Color.parseColor("#99FACC15")
+                      setColor(Color.parseColor("#99FACC15"))
                       style = Paint.Style.FILL
                   }
                   private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                      color = Color.parseColor("#44FFFFFF")
+                      setColor(Color.parseColor("#44FFFFFF"))
                       style = Paint.Style.STROKE
                       strokeWidth = 2f
                   }
